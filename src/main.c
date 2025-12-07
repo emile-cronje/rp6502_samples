@@ -19,7 +19,7 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 1      // Total number of test messages to send
+#define ITEST_MSG_COUNT 10      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 #define BATCH_SIZE 10           // Messages per batch
 
@@ -460,7 +460,9 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
     static char chunk_buf[256];
     static int buf_pos = 0;
     static ResponseMessage msg;
-    static int payload_remaining = 0;  // bytes expected after +RECV header
+    static int payload_remaining = 0;  // bytes expected after +DATA
+    static int pending_recv_len = 0;   // length announced by +RECV
+    static int recv_retry_count = 0;   // how many times we re-request remaining bytes
     static int data_response_seen = 0;  // flag to detect +DATA: only once
     char ch;
     int chars_read;
@@ -468,6 +470,9 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
     char *json_start;
     int chunk_idx;
     int idle_loops;
+    char *p;
+    char *len_start;
+    char *colon;
     
     chars_read = 0;
     chunk_idx = 0;
@@ -488,15 +493,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             if (RIA.ready & RIA_READY_TX_BIT)
                 RIA.tx = ch;
             
-            // Debug: show each char as we receive when expecting payload
-            if (payload_remaining > 0 && payload_remaining == chars_read + 1)
-            {
-                print("[First payload char: ");
-                if (RIA.ready & RIA_READY_TX_BIT)
-                    RIA.tx = ch;
-                print("]\r\n");
-            }
-            
             // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
             if (payload_remaining > 0)
             {
@@ -516,6 +512,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                 if (payload_remaining == 0)
                 {
                     print("[Payload complete - received all bytes]\r\n");
+                        pending_recv_len = 0;
                 }
             }
             else
@@ -534,7 +531,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     chunk_buf[chunk_idx] = '\0';
                 }
                 
-                // Detect +IPD header for incoming data (ESP8266 normal mode)
+                // Detect +IPD header for incoming data (ESP8266 single connection mode)
                 // Format: "+IPD,<len>:<data>" 
                 if (buf_pos >= 10)
                 {
@@ -542,7 +539,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     if (ipd_start)
                     {
                         // Find the colon that separates length from data
-                        char *colon = ipd_start + 5;  // skip "+IPD,"
+                        colon = ipd_start + 5;  // skip "+IPD,"
                         while (*colon && *colon != ':')
                             colon++;
                         
@@ -609,6 +606,9 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                             {
                                 static char recv_cmd[32];
                                 int cmd_idx = 0;
+
+                                // Remember how many bytes the modem announced
+                                pending_recv_len = len;
                                 
                                 print("[Detected +RECV with ");
                                 {
@@ -633,6 +633,8 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                     print(len_str);
                                 }
                                 print(" bytes - sending AT+CIPRECVDATA]\r\n");
+
+                                recv_retry_count = 0;  // reset retries for this payload
                                 
                                 // Build AT+CIPRECVDATA=<len> command
                                 recv_cmd[cmd_idx++] = 'A';
@@ -683,6 +685,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 
                                 // Send the command to retrieve data
                                 send_to_modem(fd, recv_cmd);
+                                print(recv_cmd);
                                 
                                 // Clear buffer to receive +DATA response
                                 // DON'T set payload_remaining yet - wait for +DATA response
@@ -772,9 +775,31 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                         // Check if there's a colon directly (format: +DATA:data without length)
                         else if (*after_data == ':' && !data_response_seen)
                         {
-                            // Just note that we found +DATA: - don't strip anything
-                            // Let the normal JSON detection (looking for '}') handle parsing
-                            print("[Detected +DATA: - will parse JSON when complete]\r\n");
+                            // Try to use pending_recv_len to know expected bytes
+                            if (pending_recv_len > 0)
+                            {
+                                // Strip the "+DATA:" prefix
+                                char *colon = after_data + 1; // points at ':'
+                                colon++; // move past ':'
+                                {
+                                    int src = colon - read_buffer;
+                                    int dst = 0;
+                                    while (src < buf_pos)
+                                        read_buffer[dst++] = read_buffer[src++];
+                                    buf_pos = dst;
+                                    read_buffer[buf_pos] = '\0';
+                                }
+                                // Expect pending_recv_len bytes total
+                                payload_remaining = pending_recv_len - buf_pos;
+                                if (payload_remaining < 0)
+                                    payload_remaining = 0;
+                                print("[Detected +DATA: - using pending length]");
+                                print("\r\n");
+                            }
+                            else
+                            {
+                                print("[Detected +DATA: - no length info]\r\n");
+                            }
                             data_response_seen = 1;  // Set flag so we don't detect it again
                             // Don't continue - let the character processing continue normally
                         }
@@ -870,34 +895,273 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             // No data this call; handle based on whether we're expecting payload
             if (payload_remaining > 0)
             {
+                int rem_before;
+                int temp;
+                char rem_str[12];
+                int rem_idx;
+                static char cmd[32];
+                int cmd_idx;
+                char len_str[12];
+                int len_idx;
+                int d_idx;
+                char digits[12];
+                
                 // We're waiting for payload bytes - keep trying with small delay
                 idle_loops++;
                 if (idle_loops > 2000)
                 {
-                    print("[Timeout waiting for payload - expected ");
+                    // Try re-requesting remaining bytes up to 3 times
+                    if (recv_retry_count < 3 && payload_remaining > 0)
                     {
-                        char rem_str[12];
-                        int rem_idx = 0;
-                        int temp = payload_remaining;
+                        recv_retry_count++;
+                        print("[Re-requesting remaining bytes: ");
+                        rem_idx = 0;
+                        temp = payload_remaining;
                         if (temp == 0)
                             rem_str[rem_idx++] = '0';
                         else
                         {
-                            char digits[12];
-                            int d_idx = 0;
                             while (temp > 0)
                             {
-                                digits[d_idx++] = '0' + (temp % 10);
+                                digits[rem_idx++] = '0' + (temp % 10);
                                 temp /= 10;
                             }
-                            while (d_idx > 0)
-                                rem_str[rem_idx++] = digits[--d_idx];
+                            while (rem_idx > 0)
+                                rem_str[rem_idx - 1] = digits[--rem_idx];
+                            rem_idx = 0;
+                            temp = payload_remaining;
+                            while (temp > 0)
+                            {
+                                digits[rem_idx++] = '0' + (temp % 10);
+                                temp /= 10;
+                            }
+                            len_idx = 0;
+                            while (rem_idx > 0)
+                                rem_str[len_idx++] = digits[--rem_idx];
+                            rem_str[len_idx] = '\0';
                         }
-                        rem_str[rem_idx] = '\0';
+                        rem_str[rem_idx == 0 ? 1 : rem_idx] = '\0';
                         print(rem_str);
+                        print("]\r\n");
+                        
+                        // Build AT+CIPRECVDATA=<remaining>
+                        cmd_idx = 0;
+                        cmd[cmd_idx++] = 'A';
+                        cmd[cmd_idx++] = 'T';
+                        cmd[cmd_idx++] = '+';
+                        cmd[cmd_idx++] = 'C';
+                        cmd[cmd_idx++] = 'I';
+                        cmd[cmd_idx++] = 'P';
+                        cmd[cmd_idx++] = 'R';
+                        cmd[cmd_idx++] = 'E';
+                        cmd[cmd_idx++] = 'C';
+                        cmd[cmd_idx++] = 'V';
+                        cmd[cmd_idx++] = 'D';
+                        cmd[cmd_idx++] = 'A';
+                        cmd[cmd_idx++] = 'T';
+                        cmd[cmd_idx++] = 'A';
+                        cmd[cmd_idx++] = '=';
+                        
+                        // remaining length as string
+                        len_idx = 0;
+                        temp = payload_remaining;
+                        if (temp == 0)
+                            len_str[len_idx++] = '0';
+                        else
+                        {
+                            while (temp > 0)
+                            {
+                                digits[len_idx++] = '0' + (temp % 10);
+                                temp /= 10;
+                            }
+                            while (len_idx > 0)
+                                len_str[len_idx - 1] = digits[--len_idx];
+                            len_idx = 0;
+                            temp = payload_remaining;
+                            while (temp > 0)
+                            {
+                                digits[len_idx++] = '0' + (temp % 10);
+                                temp /= 10;
+                            }
+                            while (len_idx > 0)
+                                len_str[len_idx - 1] = digits[--len_idx];
+                        }
+                        len_str[len_idx] = '\0';
+                        {
+                            int li = 0;
+                            while (len_str[li])
+                                cmd[cmd_idx++] = len_str[li++];
+                        }
+                        cmd[cmd_idx] = '\0';
+                        send_to_modem(fd, cmd);
+                        idle_loops = 0;
+                        continue;
                     }
+                    
+                    print("[Timeout waiting for payload - expected ");
+                    rem_idx = 0;
+                    temp = payload_remaining;
+                    if (temp == 0)
+                        rem_str[rem_idx++] = '0';
+                    else
+                    {
+                        while (temp > 0)
+                        {
+                            digits[rem_idx++] = '0' + (temp % 10);
+                            temp /= 10;
+                        }
+                        len_idx = 0;
+                        while (rem_idx > 0)
+                            rem_str[len_idx++] = digits[--rem_idx];
+                    }
+                    rem_str[len_idx] = '\0';
+                    print(rem_str);
                     print(" more bytes]\r\n");
+                    
+                    /* Try to salvage: search for complete JSON in buffer */
+                    print("[Searching buffer for JSON, buf_pos=");
+                    {
+                        char pos_str[12];
+                        int pos_idx = 0;
+                        temp = buf_pos;
+                        if (temp == 0)
+                            pos_str[pos_idx++] = '0';
+                        else
+                        {
+                            while (temp > 0)
+                            {
+                                digits[pos_idx++] = '0' + (temp % 10);
+                                temp /= 10;
+                            }
+                            len_idx = 0;
+                            while (pos_idx > 0)
+                                pos_str[len_idx++] = digits[--pos_idx];
+                            pos_str[len_idx] = '\0';
+                        }
+                        print(pos_str);
+                    }
+                    print("]\r\n");
+                    
+                    if (buf_pos > 10)
+                    {
+                        int found_brace = 0;
+                        char *json_start_ptr = NULL;
+                        int j;
+                        for (i = buf_pos - 1; i >= 0; i--)
+                        {
+                            if (read_buffer[i] == '}')
+                            {
+                                found_brace = 1;
+                                print("[Found closing brace at position ");
+                                {
+                                    char brace_str[12];
+                                    int brace_idx = 0;
+                                    temp = i;
+                                    if (temp == 0)
+                                        brace_str[brace_idx++] = '0';
+                                    else
+                                    {
+                                        while (temp > 0)
+                                        {
+                                            digits[brace_idx++] = '0' + (temp % 10);
+                                            temp /= 10;
+                                        }
+                                        len_idx = 0;
+                                        while (brace_idx > 0)
+                                            brace_str[len_idx++] = digits[--brace_idx];
+                                        brace_str[len_idx] = '\0';
+                                    }
+                                    print(brace_str);
+                                }
+                                print("]\r\n");
+                                
+                                for (j = i - 1; j >= 0; j--)
+                                {
+                                    if (read_buffer[j] == '{')
+                                    {
+                                        json_start_ptr = &read_buffer[j];
+                                        print("[Found opening brace at position ");
+                                        {
+                                            char open_str[12];
+                                            int open_idx = 0;
+                                            temp = j;
+                                            if (temp == 0)
+                                                open_str[open_idx++] = '0';
+                                            else
+                                            {
+                                                while (temp > 0)
+                                                {
+                                                    digits[open_idx++] = '0' + (temp % 10);
+                                                    temp /= 10;
+                                                }
+                                                len_idx = 0;
+                                                while (open_idx > 0)
+                                                    open_str[len_idx++] = digits[--open_idx];
+                                                open_str[len_idx] = '\0';
+                                            }
+                                            print(open_str);
+                                        }
+                                        print("]\r\n");
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        
+                        if (!found_brace)
+                        {
+                            print("[No closing brace - trying to parse incomplete JSON]\r\n");
+                            /* Search for opening brace even without closing */
+                            for (j = 0; j < buf_pos; j++)
+                            {
+                                if (read_buffer[j] == '{')
+                                {
+                                    json_start_ptr = &read_buffer[j];
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (json_start_ptr)
+                        {
+                            print("[Attempting to parse incomplete JSON]\r\n");
+                            if (parse_json_response(json_start_ptr, &msg))
+                            {
+                                print("[Parsed partial response ID:");
+                                {
+                                    char id_str[12];
+                                    int id_idx = 0;
+                                    temp = msg.id;
+                                    if (temp == 0)
+                                        id_str[id_idx++] = '0';
+                                    else
+                                    {
+                                        while (temp > 0)
+                                        {
+                                            digits[id_idx++] = '0' + (temp % 10);
+                                            temp /= 10;
+                                        }
+                                        len_idx = 0;
+                                        while (id_idx > 0)
+                                            id_str[len_idx++] = digits[--id_idx];
+                                        id_str[len_idx] = '\0';
+                                    }
+                                    print(id_str);
+                                }
+                                print("]\r\n");
+                                
+                                if (!queue_put(&g_response_queue, &msg))
+                                {
+                                    print("[Queue full]\r\n");
+                                }
+                            }
+                        }
+                    }
+                    
                     payload_remaining = 0;  // reset
+                    pending_recv_len = 0;
+                    recv_retry_count = 0;
                     break;
                 }
                 delay_ms(5);
@@ -931,6 +1195,31 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
         }
         print("]\r\n");
     }
+
+    // Debug: show buffer length after processing
+    // print("[Buffer length: ");
+    // {
+    //     char len_str[12];
+    //     int len_idx = 0;
+    //     int temp = buf_pos;
+    //     if (temp == 0)
+    //         len_str[len_idx++] = '0';
+    //     else
+    //     {
+    //         char digits[12];
+    //         int d_idx = 0;
+    //         while (temp > 0)
+    //         {
+    //             digits[d_idx++] = '0' + (temp % 10);
+    //             temp /= 10;
+    //         }
+    //         while (d_idx > 0)
+    //             len_str[len_idx++] = digits[--d_idx];
+    //     }
+    //     len_str[len_idx] = '\0';
+    //     print(len_str);
+    // }
+    // print("]\r\n");
     
     return chars_read;
 }
@@ -1025,6 +1314,11 @@ bool read_modem_response(int fd, char *buffer, int max_len, int timeout_ms)
 bool check_response(char *response, const char *expected[], int num_expected)
 {
     int i;
+
+    /* Treat any ERROR as failure even if OK also appears */
+    if (my_strstr(response, "ERROR") != NULL)
+        return false;
+
     for (i = 0; i < num_expected; i++)
     {
         if (my_strstr(response, expected[i]) != NULL)
@@ -1057,6 +1351,13 @@ bool send_at_command(int fd, char *cmd, const char *expected[], int num_expected
         print(response);
         print("\r\n");
         
+        /* Special-case bare AT: accept OK even if noise ERROR appears */
+        if ((cmd[0] == 'A' && cmd[1] == 'T' && cmd[2] == '\0') && my_strstr(response, "OK"))
+        {
+            print("OK\r\n");
+            return true;
+        }
+
         if (check_response(response, expected, num_expected))
         {
             print("OK\r\n");
@@ -1146,9 +1447,9 @@ bool init_wifi(int fd)
     if (!send_at_command(fd, "AT+CIPMUX=0", ok_resp, 1))
         return false;
     
-    // AT+CIPMODE=0 - Normal mode (use AT+CIPSEND for reliable delivery)
-    if (!send_at_command(fd, "AT+CIPMODE=0", ok_resp, 1))
-        return false;
+    // AT+CIPRECVMODE=0 - Active receive mode (data pushed via +IPD)
+    // This may fail on some firmware - continue even if it errors
+    send_at_command(fd, "AT+CIPRECVMODE=0", ok_resp, 1);
     
     // AT+CIPSTART - Start TCP connection
     my_sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", SERVER_IP, SERVER_PORT);
@@ -1576,7 +1877,7 @@ bool send_message(int fd, char *message)
     // Total length includes \r\n terminator
     total_len = msg_len + 2;
     
-    // Build AT+CIPSEND=<length> command
+    // Build AT+CIPSEND=<length> command (single connection mode)
     cmd[0] = 'A';
     cmd[1] = 'T';
     cmd[2] = '+';
