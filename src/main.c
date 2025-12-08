@@ -784,7 +784,9 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 {
                                     int src = colon - read_buffer;
                                     int dst = 0;
-                                    while (src < buf_pos)
+                                                pending_recv_len = 0;
+                                                recv_retry_count = 0;
+                                                data_response_seen = 0;
                                         read_buffer[dst++] = read_buffer[src++];
                                     buf_pos = dst;
                                     read_buffer[buf_pos] = '\0';
@@ -1162,6 +1164,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     payload_remaining = 0;  // reset
                     pending_recv_len = 0;
                     recv_retry_count = 0;
+                    data_response_seen = 0;
                     break;
                 }
                 delay_ms(5);
