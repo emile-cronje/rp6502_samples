@@ -813,7 +813,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             // Look for complete JSON objects
             if (ch == '}')
             {
-                print("[Found }]\r\n");
+//                print("[Found }]\r\n");
                 // Search backwards for opening brace
                 json_start = NULL;
                 for (i = buf_pos - 1; i >= 0; i--)
@@ -1170,8 +1170,8 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             {
                 // We read header/data but not expecting payload - short idle wait
                 idle_loops++;
-                if (idle_loops > 1000)
-                    break;  // stop after ~5s idle gap once we read something
+                if (idle_loops > 100)
+                    break;  // stop after ~500ms idle gap once we read something
                 delay_ms(5);
             }
             else
