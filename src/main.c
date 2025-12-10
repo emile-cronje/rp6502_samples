@@ -19,7 +19,7 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 10      // Total number of test messages to send
+#define ITEST_MSG_COUNT 40      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 #define BATCH_SIZE 10           // Messages per batch
 
@@ -28,7 +28,7 @@
 #define NULL ((void*)0)
 
 // Response queue for received messages
-#define RESPONSE_QUEUE_SIZE 10
+//#define RESPONSE_QUEUE_SIZE 10
 typedef struct {
     int id;
     char category[16];
@@ -38,7 +38,7 @@ typedef struct {
 } ResponseMessage;
 
 typedef struct {
-    ResponseMessage messages[RESPONSE_QUEUE_SIZE];
+    ResponseMessage messages[ITEST_MSG_COUNT];
     int write_idx;
     int read_idx;
     int count;
@@ -56,7 +56,7 @@ typedef struct {
 } SentMessageTracker;
 
 typedef struct {
-    SentMessageTracker messages[SENT_MESSAGE_TRACKING_SIZE];
+    SentMessageTracker messages[ITEST_MSG_COUNT];
     int count;
 } MessageTracker;
 
@@ -137,7 +137,7 @@ void tracker_init(MessageTracker *t)
 {
     int i;
     t->count = 0;
-    for (i = 0; i < SENT_MESSAGE_TRACKING_SIZE; i++)
+    for (i = 0; i < ITEST_MSG_COUNT; i++)
     {
         t->messages[i].id = -1;
         t->messages[i].sent = false;
@@ -147,7 +147,7 @@ void tracker_init(MessageTracker *t)
 
 void tracker_mark_sent(MessageTracker *t, int msg_id)
 {
-    if (t->count < SENT_MESSAGE_TRACKING_SIZE)
+    if (t->count < ITEST_MSG_COUNT)
     {
         t->messages[t->count].id = msg_id;
         t->messages[t->count].sent = true;
@@ -321,11 +321,11 @@ void tracker_print_status(MessageTracker *t)
 
 bool queue_put(ResponseQueue *q, ResponseMessage *msg)
 {
-    if (q->count >= RESPONSE_QUEUE_SIZE)
+    if (q->count >= ITEST_MSG_COUNT)
         return false;
     
     q->messages[q->write_idx] = *msg;
-    q->write_idx = (q->write_idx + 1) % RESPONSE_QUEUE_SIZE;
+    q->write_idx = (q->write_idx + 1) % ITEST_MSG_COUNT;
     q->count++;
     return true;
 }
@@ -338,7 +338,7 @@ bool queue_get(ResponseQueue *q, ResponseMessage *msg)
     }
     
     *msg = q->messages[q->read_idx];
-    q->read_idx = (q->read_idx + 1) % RESPONSE_QUEUE_SIZE;
+    q->read_idx = (q->read_idx + 1) % ITEST_MSG_COUNT;
     q->count--;
     
     // Print the response message being retrieved from queue
@@ -490,8 +490,8 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             ch = ria_pop_char();
             
             // Echo to console
-            if (RIA.ready & RIA_READY_TX_BIT)
-                RIA.tx = ch;
+            // if (RIA.ready & RIA_READY_TX_BIT)
+            //     RIA.tx = ch;
             
             // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
             if (payload_remaining > 0)
@@ -795,6 +795,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 payload_remaining = pending_recv_len - buf_pos;
                                 if (payload_remaining < 0)
                                     payload_remaining = 0;
+
                                 print("[Detected +DATA: - using pending length]");
                                 print("\r\n");
                             }
