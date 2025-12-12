@@ -19,11 +19,11 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 40      // Total number of test messages to send
+#define ITEST_MSG_COUNT 20      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 #define BATCH_SIZE 10           // Messages per batch
 
-#define RESPONSE_BUFFER_SIZE 256
+#define RESPONSE_BUFFER_SIZE 512
 #define COMMAND_TIMEOUT 10000  // milliseconds
 #define NULL ((void*)0)
 
@@ -610,29 +610,29 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 // Remember how many bytes the modem announced
                                 pending_recv_len = len;
                                 
-                                print("[Detected +RECV with ");
-                                {
-                                    char len_str[12];
-                                    int len_idx = 0;
-                                    int temp = len;
-                                    if (temp == 0)
-                                        len_str[len_idx++] = '0';
-                                    else
-                                    {
-                                        char digits[12];
-                                        int d_idx = 0;
-                                        while (temp > 0)
-                                        {
-                                            digits[d_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        while (d_idx > 0)
-                                            len_str[len_idx++] = digits[--d_idx];
-                                    }
-                                    len_str[len_idx] = '\0';
-                                    print(len_str);
-                                }
-                                print(" bytes - sending AT+CIPRECVDATA]\r\n");
+                                // print("[Detected +RECV with ");
+                                // {
+                                //     char len_str[12];
+                                //     int len_idx = 0;
+                                //     int temp = len;
+                                //     if (temp == 0)
+                                //         len_str[len_idx++] = '0';
+                                //     else
+                                //     {
+                                //         char digits[12];
+                                //         int d_idx = 0;
+                                //         while (temp > 0)
+                                //         {
+                                //             digits[d_idx++] = '0' + (temp % 10);
+                                //             temp /= 10;
+                                //         }
+                                //         while (d_idx > 0)
+                                //             len_str[len_idx++] = digits[--d_idx];
+                                //     }
+                                //     len_str[len_idx] = '\0';
+                                //     print(len_str);
+                                // }
+                                // print(" bytes - sending AT+CIPRECVDATA]\r\n");
 
                                 recv_retry_count = 0;  // reset retries for this payload
                                 
@@ -796,8 +796,8 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 if (payload_remaining < 0)
                                     payload_remaining = 0;
 
-                                print("[Detected +DATA: - using pending length]");
-                                print("\r\n");
+//                                print("[Detected +DATA: - using pending length]");
+  //                              print("\r\n");
                             }
                             else
                             {
@@ -1942,6 +1942,7 @@ bool send_message(int fd, char *message)
         {
             ria_push_char(1);
             ria_set_ax(fd);
+
             if (ria_call_int(RIA_OP_READ_XSTACK))
             {
                 ch = ria_pop_char();
@@ -2020,6 +2021,7 @@ bool send_message(int fd, char *message)
         len_str[len_idx] = '\0';
         print(len_str);
     }
+    
     print(" bytes\r\n");
 //    print("Data: ");
     //print(message);    
@@ -2108,7 +2110,7 @@ bool send_message(int fd, char *message)
         }
     }
     
-    print("--- Message sent ---\r\n");
+    //print("--- Message sent ---\r\n");
     return true;
 }
 
