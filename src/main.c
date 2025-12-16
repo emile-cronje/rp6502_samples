@@ -588,9 +588,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
         {
             ch = ria_pop_char();
             
-            // Debug: Echo EVERY character to see what's arriving
-            if (RIA.ready & RIA_READY_TX_BIT)
-                RIA.tx = ch;
+            // Echo disabled to avoid any UART side-effects during receive
             
             // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
             if (payload_remaining > 0)
@@ -611,10 +609,14 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                         read_buffer[buf_pos++] = ch;
                         read_buffer[buf_pos] = '\0';
                     }
-                    if (chunk_idx < 240)
+                    // Only record chunk debug when not in payload mode
+                    if (payload_remaining == 0 && !data_response_seen)
                     {
-                        chunk_buf[chunk_idx++] = ch;
-                        chunk_buf[chunk_idx] = '\0';
+                        if (chunk_idx < 240)
+                        {
+                            chunk_buf[chunk_idx++] = ch;
+                            chunk_buf[chunk_idx] = '\0';
+                        }
                     }
                 }
                 payload_remaining--;
@@ -627,6 +629,42 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     
                     // Now that we have the complete payload, look for JSON
                     // Use appropriate buffer based on how we received it
+                    // Debug: dump first bytes of accumulated payload to see corruption
+                    print("[Payload len=");
+                    {
+                        char len_str[12];
+                        int len_idx = 0;
+                        int temp_len = data_response_seen ? g_payload_pos : buf_pos;
+                        if (temp_len == 0)
+                            len_str[len_idx++] = '0';
+                        else
+                        {
+                            char digits[12];
+                            int d_idx = 0;
+                            while (temp_len > 0)
+                            {
+                                digits[d_idx++] = '0' + (temp_len % 10);
+                                temp_len /= 10;
+                            }
+                            while (d_idx > 0)
+                                len_str[len_idx++] = digits[--d_idx];
+                        }
+                        len_str[len_idx] = '\0';
+                        print(len_str);
+                    }
+                    print(", first 60 bytes: ");
+                    {
+                        int dbg_i;
+                        char *dbg_src = data_response_seen ? g_payload_buffer : read_buffer;
+                        int dbg_len = data_response_seen ? g_payload_pos : buf_pos;
+                        for (dbg_i = 0; dbg_i < 60 && dbg_i < dbg_len; dbg_i++)
+                        {
+                            if (RIA.ready & RIA_READY_TX_BIT)
+                                RIA.tx = dbg_src[dbg_i];
+                        }
+                    }
+                    print("]\r\n");
+
                     if (data_response_seen && g_payload_pos > 0)
                     {
                         // Use g_payload_buffer (from +DATA: response)
