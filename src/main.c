@@ -64,6 +64,11 @@ static MessageTracker g_sent_tracker;
 static time_t g_test_start_time = 0;  /* Unix timestamp when test started */
 static unsigned int g_test_final_duration_ms = 0;
 static bool g_test_complete = false;
+static bool g_status_printed = false;  /* ensure status prints only once automatically */
+
+// Global payload buffer for +DATA: response accumulation
+static char g_payload_buffer[1024];
+static int g_payload_pos = 0;
 
 // Forward declarations
 int parse_number(char *str);
@@ -590,15 +595,27 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
             if (payload_remaining > 0)
             {
-                if (buf_pos < 1023)
+                // If we detected +DATA:, store directly to g_payload_buffer to avoid register issues
+                if (data_response_seen && g_payload_pos < 1023)
                 {
-                    read_buffer[buf_pos++] = ch;
-                    read_buffer[buf_pos] = '\0';
+                    // Store the character we already read (ch) - DON'T call ria_pop_char again!
+                    g_payload_buffer[g_payload_pos] = ch;
+                    g_payload_pos++;
+                    g_payload_buffer[g_payload_pos] = '\0';
                 }
-                if (chunk_idx < 240)
+                else
                 {
-                    chunk_buf[chunk_idx++] = ch;
-                    chunk_buf[chunk_idx] = '\0';
+                    // Store to read_buffer when still looking for +DATA:
+                    if (buf_pos < 1023)
+                    {
+                        read_buffer[buf_pos++] = ch;
+                        read_buffer[buf_pos] = '\0';
+                    }
+                    if (chunk_idx < 240)
+                    {
+                        chunk_buf[chunk_idx++] = ch;
+                        chunk_buf[chunk_idx] = '\0';
+                    }
                 }
                 payload_remaining--;
                 
@@ -609,13 +626,31 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     pending_recv_len = 0;
                     
                     // Now that we have the complete payload, look for JSON
-                    json_start = NULL;
-                    for (i = buf_pos - 1; i >= 0; i--)
+                    // Use appropriate buffer based on how we received it
+                    if (data_response_seen && g_payload_pos > 0)
                     {
-                        if (read_buffer[i] == '{')
+                        // Use g_payload_buffer (from +DATA: response)
+                        json_start = NULL;
+                        for (i = g_payload_pos - 1; i >= 0; i--)
                         {
-                            json_start = &read_buffer[i];
-                            break;
+                            if (g_payload_buffer[i] == '{')
+                            {
+                                json_start = &g_payload_buffer[i];
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Use read_buffer (old path)
+                        json_start = NULL;
+                        for (i = buf_pos - 1; i >= 0; i--)
+                        {
+                            if (read_buffer[i] == '{')
+                            {
+                                json_start = &read_buffer[i];
+                                break;
+                            }
                         }
                     }
                     
@@ -685,6 +720,9 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                         // Clear the buffer after processing
                         buf_pos = 0;
                         read_buffer[0] = '\0';
+                        g_payload_pos = 0;
+                        g_payload_buffer[0] = '\0';
+                        data_response_seen = 0;
                     }
                 }
             }
@@ -985,24 +1023,68 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                             // Try to use pending_recv_len to know expected bytes
                             if (pending_recv_len > 0)
                             {
-                                // Strip the "+DATA:" prefix
-                                char *colon = after_data + 1; // points at ':'
-                                colon++; // move past ':'
+                                char *colon;
+                                int data_start_in_buf;
                                 
-                                // Calculate how many bytes we expect (use pending_recv_len BEFORE resetting it!)
-                                payload_remaining = pending_recv_len;
+                                // Mark that we've detected +DATA:
+                                data_response_seen = 1;
                                 
+                                // after_data points to ':' after "+DATA"
+                                // We want to start copying from the byte AFTER the ':'
+                                colon = after_data + 1; // points to character after ':'
+                                
+                                // Calculate position of data after colon
+                                data_start_in_buf = colon - read_buffer;
+                                
+                                // Copy any bytes already in buffer after colon to g_payload_buffer
+                                g_payload_pos = 0;
+                                while (data_start_in_buf < buf_pos && g_payload_pos < 1023)
                                 {
-                                    int src = colon - read_buffer;
-                                    int dst = 0;
-                                    while (src < buf_pos)
-                                        read_buffer[dst++] = read_buffer[src++];
-                                    buf_pos = dst;
-                                    read_buffer[buf_pos] = '\0';
+                                    g_payload_buffer[g_payload_pos] = read_buffer[data_start_in_buf];
+                                    g_payload_pos++;
+                                    data_start_in_buf++;
+                                }
+                                g_payload_buffer[g_payload_pos] = '\0';
+                                
+                                // Debug: show what we copied
+                                if (g_payload_pos > 0)
+                                {
+                                    print("(copied ");
+                                    {
+                                        char dbg_str[12];
+                                        int dbg_idx = 0;
+                                        int dbg_temp = g_payload_pos;
+                                        if (dbg_temp == 0)
+                                            dbg_str[dbg_idx++] = '0';
+                                        else
+                                        {
+                                            char dbg_digits[12];
+                                            int dbg_d_idx = 0;
+                                            while (dbg_temp > 0)
+                                            {
+                                                dbg_digits[dbg_d_idx++] = '0' + (dbg_temp % 10);
+                                                dbg_temp /= 10;
+                                            }
+                                            while (dbg_d_idx > 0)
+                                                dbg_str[dbg_idx++] = dbg_digits[--dbg_d_idx];
+                                        }
+                                        dbg_str[dbg_idx] = '\0';
+                                        print(dbg_str);
+                                    }
+                                    print(" bytes: ");
+                                    {
+                                        int dbg_i;
+                                        for (dbg_i = 0; dbg_i < 10 && dbg_i < g_payload_pos; dbg_i++)
+                                        {
+                                            if (RIA.ready & RIA_READY_TX_BIT)
+                                                RIA.tx = g_payload_buffer[dbg_i];
+                                        }
+                                    }
+                                    print(") ");
                                 }
                                 
-                                // Now account for data already in buffer
-                                payload_remaining -= buf_pos;
+                                // Calculate how many more bytes we need (use pending_recv_len)
+                                payload_remaining = pending_recv_len - g_payload_pos;
                                 if (payload_remaining < 0)
                                     payload_remaining = 0;
 
@@ -1033,8 +1115,8 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                             else
                             {
                                 print("[Detected +DATA: - no length info]\r\n");
+                                data_response_seen = 1;
                             }
-                            data_response_seen = 1;  // Set flag so we don't detect it again
                             // Don't continue - let the character processing continue normally
                         }
                     }
@@ -2864,8 +2946,12 @@ void main()
                     g_test_final_duration_ms = (unsigned int)(end_time - g_test_start_time) * 1000;  /* Convert seconds to ms */
                     g_test_complete = true;
                 }
-                print("\r\n*** ALL MESSAGES RECEIVED! ***\r\n");
-                tracker_print_status(&g_sent_tracker, 0);
+                if (!g_status_printed)
+                {
+                    print("\r\n*** ALL MESSAGES RECEIVED! ***\r\n");
+                    tracker_print_status(&g_sent_tracker, 0);
+                    g_status_printed = true;
+                }
                 loop_count = 0;  // Reset to avoid repeated printing
             }
             loop_count = 0;
