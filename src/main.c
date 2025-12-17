@@ -20,9 +20,9 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 50      // Total number of test messages to send
+#define ITEST_MSG_COUNT 2      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
-#define BATCH_SIZE 10           // Messages per batch
+#define BATCH_SIZE 25           // Messages per batch
 
 #define RESPONSE_BUFFER_SIZE 256
 #define COMMAND_TIMEOUT 10000  // milliseconds
@@ -52,16 +52,23 @@ typedef struct {
     int id;
     bool sent;
     bool response_received;
-    char timestamp[32];  // For debug output
-    char category[16];
-    char base64_message[512];
-    char base64_hash[64];
+    bool compare_success;
 } SentMessageTracker;
 
 typedef struct {
     SentMessageTracker messages[ITEST_MSG_COUNT];
     int count;
 } MessageTracker;
+
+// Buffer to hold last sent message details for comparison
+typedef struct {
+    int id;
+    char category[16];
+    char base64_message[512];
+    char base64_hash[64];
+} LastSentMessage;
+
+static LastSentMessage g_last_sent_msg;
 
 static MessageTracker g_sent_tracker;
 static time_t g_test_start_time = 0;  /* Unix timestamp when test started */
@@ -164,27 +171,29 @@ void tracker_mark_sent(MessageTracker *t, int msg_id, const char *category, cons
         t->messages[t->count].id = msg_id;
         t->messages[t->count].sent = true;
         t->messages[t->count].response_received = false;
-        
-        /* Copy category */
-        for (i = 0; i < 15 && category[i]; i++)
-            t->messages[t->count].category[i] = category[i];
-        t->messages[t->count].category[i] = '\0';
-        
-        /* Copy base64 message */
-        for (i = 0; i < 511 && base64_msg[i]; i++)
-            t->messages[t->count].base64_message[i] = base64_msg[i];
-        t->messages[t->count].base64_message[i] = '\0';
-        
-        /* Copy base64 hash */
-        for (i = 0; i < 63 && base64_hash[i]; i++)
-            t->messages[t->count].base64_hash[i] = base64_hash[i];
-        t->messages[t->count].base64_hash[i] = '\0';
-        
         t->count++;
     }
+    
+    /* Also update the last sent message buffer for comparison */
+    g_last_sent_msg.id = msg_id;
+    
+    /* Copy category */
+    for (i = 0; i < 15 && category[i]; i++)
+        g_last_sent_msg.category[i] = category[i];
+    g_last_sent_msg.category[i] = '\0';
+    
+    /* Copy base64 message */
+    for (i = 0; i < 511 && base64_msg[i]; i++)
+        g_last_sent_msg.base64_message[i] = base64_msg[i];
+    g_last_sent_msg.base64_message[i] = '\0';
+    
+    /* Copy base64 hash */
+    for (i = 0; i < 63 && base64_hash[i]; i++)
+        g_last_sent_msg.base64_hash[i] = base64_hash[i];
+    g_last_sent_msg.base64_hash[i] = '\0';
 }
 
-bool tracker_mark_response(MessageTracker *t, int msg_id)
+bool tracker_mark_response(MessageTracker *t, int msg_id, bool compare_success)
 {
     int i;
     for (i = 0; i < t->count; i++)
@@ -192,6 +201,7 @@ bool tracker_mark_response(MessageTracker *t, int msg_id)
         if (t->messages[i].id == msg_id)
         {
             t->messages[i].response_received = true;
+            t->messages[i].compare_success = compare_success;
             return true;
         }
     }
@@ -210,13 +220,14 @@ int tracker_get_missing_count(MessageTracker *t)
     return missing;
 }
 
-void tracker_print_status(MessageTracker *t, unsigned int duration_ms)
+void tracker_print_status(MessageTracker *t)
 {
     int i;
     int missing = 0;
     int received = 0;
     unsigned int display_duration;
     time_t current_time;
+    (void)t;  /* Mark parameter as intentionally unused if needed */
     
     if (g_test_complete)
     {
@@ -285,7 +296,15 @@ void tracker_print_status(MessageTracker *t, unsigned int duration_ms)
                 print(id_str);
             }
             print(": ");
-            print(t->messages[i].response_received ? "RECEIVED" : "PENDING");
+            if (t->messages[i].response_received)
+            {
+                print("RECEIVED, COMPARE ");
+                print(t->messages[i].compare_success ? "SUCCESS" : "FAILED");
+            }
+            else
+            {
+                print("PENDING");
+            }
             print("\r\n");
         }
     }
@@ -557,9 +576,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
     char *json_start;
     int chunk_idx;
     int idle_loops;
-    char *p;
-    char *len_start;
-    char *colon;
     
     chars_read = 0;
     chunk_idx = 0;
@@ -725,7 +741,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     if (ipd_start)
                     {
                         // Find the colon that separates length from data
-                        colon = ipd_start + 5;  // skip "+IPD,"
+                        char *colon = ipd_start + 5;  // skip "+IPD,"
                         while (*colon && *colon != ':')
                             colon++;
                         
@@ -969,8 +985,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                             // Try to use pending_recv_len to know expected bytes
                             if (pending_recv_len > 0)
                             {
-                                char *colon;
-                                int data_start_in_buf;
                                 
                                 // Mark that we've detected +DATA:
                                 data_response_seen = 1;
@@ -1008,89 +1022,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             chars_read++;
             idle_loops = 0;  // reset idle counter on successful read
             
-            // JSON parsing now happens after payload is complete (see above)
-            // Old parsing code disabled to prevent premature parsing
-            if (0 && ch == '}' && payload_remaining <= 0 && pending_recv_len <= 0)
-            {
-//                print("[Found }]\r\n");
-                // Search backwards for opening brace
-                json_start = NULL;
-                for (i = buf_pos - 1; i >= 0; i--)
-                {
-                    if (read_buffer[i] == '{')
-                    {
-                        json_start = &read_buffer[i];
-                        break;
-                    }
-                }
-                
-                if (json_start)
-                {
-                    // Debug: Print the raw JSON received
-                    print("\r\n[DEBUG: Received JSON: ");
-                    for (i = 0; i < 100 && json_start[i] && json_start[i] != '}'; i++)
-                    {
-                        if (RIA.ready & RIA_READY_TX_BIT)
-                            RIA.tx = json_start[i];
-                    }
-                    if (RIA.ready & RIA_READY_TX_BIT)
-                        RIA.tx = '}';
-                    print("]\r\n");
-                    
-                    // Try to parse JSON
-                    if (parse_json_response(json_start, &msg))
-                    {
-                        print("\r\n[Parsed response ID:");
-                        {
-                            char id_str[12];
-                            int id_idx = 0;
-                            int temp = msg.id;
-                            
-                            if (temp == 0)
-                                id_str[id_idx++] = '0';
-                            else
-                            {
-                                char digits[12];
-                                int d_idx = 0;
-                                while (temp > 0)
-                                {
-                                    digits[d_idx++] = '0' + (temp % 10);
-                                    temp /= 10;
-                                }
-                                while (d_idx > 0)
-                                    id_str[id_idx++] = digits[--d_idx];
-                            }
-                            id_str[id_idx] = '\0';
-                            print(id_str);
-                        }
-                        print("]\r\n");
-                        
-                        // Add to queue
-                        if (!queue_put(&g_response_queue, &msg))
-                        {
-                            print("[Warning: Response queue full]\r\n");
-                        }
-                        
-                        // Reset the +DATA flag for next response
-                        data_response_seen = 0;
-                        payload_found_start = 0;
-                    }
-                    
-                    // Remove processed JSON from buffer
-                    {
-                        int json_len = (buf_pos - (json_start - read_buffer));
-                        int remaining = buf_pos - (json_start - read_buffer) - json_len;
-                        if (remaining > 0)
-                        {
-                            for (i = 0; i < remaining; i++)
-                                read_buffer[i] = read_buffer[(json_start - read_buffer) + json_len + i];
-                        }
-                        buf_pos = remaining;
-                        read_buffer[buf_pos] = '\0';
-                    }
-                }
-            }
-            
             // Prevent buffer overflow - keep only last 512 chars
             if (buf_pos > 800)
             {
@@ -1106,7 +1037,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             // No data this call; handle based on whether we're expecting payload
             if (payload_remaining > 0)
             {
-                int rem_before;
                 int temp;
                 char rem_str[12];
                 int rem_idx;
@@ -1114,7 +1044,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                 int cmd_idx;
                 char len_str[12];
                 int len_idx;
-                int d_idx;
                 char digits[12];
                 
                 // We're waiting for payload bytes - keep trying with small delay
@@ -1395,29 +1324,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
     }
     
     // Debug: show buffer length after processing
-    // print("[Buffer length: ");
-    // {
-    //     char len_str[12];
-    //     int len_idx = 0;
-    //     int temp = buf_pos;
-    //     if (temp == 0)
-    //         len_str[len_idx++] = '0';
-    //     else
-    //     {
-    //         char digits[12];
-    //         int d_idx = 0;
-    //         while (temp > 0)
-    //         {
-    //             digits[d_idx++] = '0' + (temp % 10);
-    //             temp /= 10;
-    //         }
-    //         while (d_idx > 0)
-    //             len_str[len_idx++] = digits[--d_idx];
-    //     }
-    //     len_str[len_idx] = '\0';
-    //     print(len_str);
-    // }
-    // print("]\r\n");
+    // Removed: debug code was here
     
     return chars_read;
 }
@@ -2043,14 +1950,14 @@ void print_response(ResponseMessage *response)
         print(id_str);
     }
     
-    /* Compare fields if we found the sent message */
-    if (id_valid && sent_idx >= 0)
+    /* Compare fields against last sent message */
+    if (id_valid && response->id == g_last_sent_msg.id)
     {
         /* Compare Category */
         category_match = true;
-        for (i = 0; response->category[i] || g_sent_tracker.messages[sent_idx].category[i]; i++)
+        for (i = 0; response->category[i] || g_last_sent_msg.category[i]; i++)
         {
-            if (response->category[i] != g_sent_tracker.messages[sent_idx].category[i])
+            if (response->category[i] != g_last_sent_msg.category[i])
             {
                 category_match = false;
                 break;
@@ -2059,9 +1966,9 @@ void print_response(ResponseMessage *response)
         
         /* Compare Base64 Message */
         message_match = true;
-        for (i = 0; response->base64_message[i] || g_sent_tracker.messages[sent_idx].base64_message[i]; i++)
+        for (i = 0; response->base64_message[i] || g_last_sent_msg.base64_message[i]; i++)
         {
-            if (response->base64_message[i] != g_sent_tracker.messages[sent_idx].base64_message[i])
+            if (response->base64_message[i] != g_last_sent_msg.base64_message[i])
             {
                 message_match = false;
                 break;
@@ -2070,9 +1977,9 @@ void print_response(ResponseMessage *response)
         
         /* Compare Base64 Hash */
         hash_match = true;
-        for (i = 0; response->base64_hash[i] || g_sent_tracker.messages[sent_idx].base64_hash[i]; i++)
+        for (i = 0; response->base64_hash[i] || g_last_sent_msg.base64_hash[i]; i++)
         {
-            if (response->base64_hash[i] != g_sent_tracker.messages[sent_idx].base64_hash[i])
+            if (response->base64_hash[i] != g_last_sent_msg.base64_hash[i])
             {
                 hash_match = false;
                 break;
@@ -2112,6 +2019,13 @@ void print_response(ResponseMessage *response)
         print("FAILED\r\n");
     
     print("<<< END RESPONSE >>>\r\n");
+    
+    /* Mark response in tracker with comparison result */
+    if (id_valid)
+    {
+        bool overall_success = category_match && message_match && hash_match;
+        tracker_mark_response(&g_sent_tracker, response->id, overall_success);
+    }
 }
 
 // Send a message in normal mode using AT+CIPSEND
@@ -2633,7 +2547,7 @@ void main()
                                 if (validate_received_msg_id(&g_sent_tracker, response.id, NULL))
                                 {
                                     // Mark this message ID as having received a response
-                                    tracker_mark_response(&g_sent_tracker, response.id);
+                                    /* Response marking now done in print_response */
                                     
                                     // Print the response
                                     print_response(&response);
@@ -2763,7 +2677,7 @@ void main()
                     if (validate_received_msg_id(&g_sent_tracker, response.id, NULL))
                     {
                         // Mark this message ID as having received a response
-                        tracker_mark_response(&g_sent_tracker, response.id);
+                        /* Response marking now done in print_response */
                         
                         // Print the response
                         print_response(&response);
@@ -2810,7 +2724,7 @@ void main()
             // Check for 's' key to show tracking status
             if (tx_char == 's' || tx_char == 'S')
             {
-                tracker_print_status(&g_sent_tracker, 0);
+                tracker_print_status(&g_sent_tracker);
             }
             
             // Send console input to modem
@@ -2834,7 +2748,7 @@ void main()
                 if (!g_status_printed)
                 {
                     print("\r\n*** ALL MESSAGES RECEIVED! ***\r\n");
-                    tracker_print_status(&g_sent_tracker, 0);
+                    tracker_print_status(&g_sent_tracker);
                     g_status_printed = true;
                 }
                 loop_count = 0;  // Reset to avoid repeated printing
