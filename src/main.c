@@ -467,16 +467,7 @@ bool queue_get(ResponseQueue *q, ResponseMessage *msg)
     print(", Category: ");
     print(msg->category);
     print(", Message: ");
-    {
-        int i;
-        for (i = 0; i < 40 && msg->base64_message[i]; i++)
-        {
-            if (RIA.ready & RIA_READY_TX_BIT)
-                RIA.tx = msg->base64_message[i];
-        }
-        if (msg->base64_message[40])
-            print("...");
-    }
+    print(msg->base64_message);
     print("\r\n");
     
     return true;
@@ -501,15 +492,17 @@ bool parse_json_response(char *json, ResponseMessage *msg)
     if (p)
     {
         p += 5; // skip "Id":
-        while (*p == ' ' || *p == '\t') p++;
+        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
         msg->id = parse_number(p);
     }
     
-    // Find "Category":"
-    p = my_strstr(json, "\"Category\":\"");
+    // Find "Category":
+    p = my_strstr(json, "\"Category\":");
     if (p)
     {
-        p += 12; // skip "Category":"
+        p += 11; // skip "Category":
+        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
+        if (*p == '"') p++;  // Skip opening quote
         start = p;
         len = 0;
         while (*p && *p != '"' && len < 15)
@@ -519,11 +512,13 @@ bool parse_json_response(char *json, ResponseMessage *msg)
         msg->category[len] = '\0';
     }
     
-    // Find "Base64Message":"
-    p = my_strstr(json, "\"Base64Message\":\"");
+    // Find "Base64Message":
+    p = my_strstr(json, "\"Base64Message\":");
     if (p)
     {
-        p += 17; // skip "Base64Message":"
+        p += 16; // skip "Base64Message":
+        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
+        if (*p == '"') p++;  // Skip opening quote
         start = p;
         len = 0;
         while (*p && *p != '"' && len < 511)
@@ -533,11 +528,13 @@ bool parse_json_response(char *json, ResponseMessage *msg)
         msg->base64_message[len] = '\0';
     }
     
-    // Find "Base64MessageHash":"
-    p = my_strstr(json, "\"Base64MessageHash\":\"");
+    // Find "Base64MessageHash":
+    p = my_strstr(json, "\"Base64MessageHash\":");
     if (p)
     {
-        p += 21; // skip "Base64MessageHash":"
+        p += 20; // skip "Base64MessageHash":
+        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
+        if (*p == '"') p++;  // Skip opening quote
         start = p;
         len = 0;
         while (*p && *p != '"' && len < 63)
@@ -563,6 +560,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
     static int pending_recv_len = 0;   // length announced by +RECV
     static int recv_retry_count = 0;   // how many times we re-request remaining bytes
     static int data_response_seen = 0;  // flag to detect +DATA: only once
+    static int payload_found_start = 0;  // flag: have we seen the first '{' yet
     char ch;
     int chars_read;
     int i;
@@ -593,13 +591,53 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
             if (payload_remaining > 0)
             {
+                // Debug first byte of payload on first iteration
+                static int payload_first_byte_shown = 0;
+                if (!payload_first_byte_shown && data_response_seen)
+                {
+                    print("[First payload byte (decimal): ");
+                    {
+                        int byte_val = (unsigned char)ch;
+                        char bnum[12];
+                        int bidx = 0;
+                        if (byte_val == 0)
+                            bnum[bidx++] = '0';
+                        else
+                        {
+                            char bdigits[12];
+                            int bd_idx = 0;
+                            int bt = byte_val;
+                            while (bt > 0)
+                            {
+                                bdigits[bd_idx++] = '0' + (bt % 10);
+                                bt /= 10;
+                            }
+                            while (bd_idx > 0)
+                                bnum[bidx++] = bdigits[--bd_idx];
+                        }
+                        bnum[bidx] = '\0';
+                        print(bnum);
+                    }
+                    print("]\r\n");
+                    payload_first_byte_shown = 1;
+                }
                 // If we detected +DATA:, store directly to g_payload_buffer to avoid register issues
                 if (data_response_seen && g_payload_pos < 1023)
                 {
-                    // Store the character we already read (ch) - DON'T call ria_pop_char again!
-                    g_payload_buffer[g_payload_pos] = ch;
-                    g_payload_pos++;
-                    g_payload_buffer[g_payload_pos] = '\0';
+                    // Skip leading whitespace until we find the opening brace
+                    if (!payload_found_start && (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t'))
+                    {
+                        // Skip this whitespace byte, don't count it
+                    }
+                    else
+                    {
+                        payload_found_start = 1;  // Mark that we've started storing real data
+                        // Store the character we already read (ch) - DON'T call ria_pop_char again!
+                        g_payload_buffer[g_payload_pos] = ch;
+                        g_payload_pos++;
+                        g_payload_buffer[g_payload_pos] = '\0';
+                        payload_remaining--;
+                    }
                 }
                 else
                 {
@@ -618,13 +656,40 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                             chunk_buf[chunk_idx] = '\0';
                         }
                     }
+                    payload_remaining--;
                 }
-                payload_remaining--;
                 
                 // Debug: show progress
                 if (payload_remaining == 0)
                 {
-                    print("[Payload complete - received all bytes]\r\n");
+                    print("[Payload complete - received all bytes, data_response_seen=");
+                    if (data_response_seen)
+                        print("1");
+                    else
+                        print("0");
+                    print(", g_payload_pos=");
+                    {
+                        char pnum[12];
+                        int pidx = 0;
+                        int ptemp = g_payload_pos;
+                        if (ptemp == 0)
+                            pnum[pidx++] = '0';
+                        else
+                        {
+                            char pdigits[12];
+                            int pdidx = 0;
+                            while (ptemp > 0)
+                            {
+                                pdigits[pdidx++] = '0' + (ptemp % 10);
+                                ptemp /= 10;
+                            }
+                            while (pdidx > 0)
+                                pnum[pidx++] = pdigits[--pdidx];
+                        }
+                        pnum[pidx] = '\0';
+                        print(pnum);
+                    }
+                    print("]\r\n");
                     pending_recv_len = 0;
                     
                     // Now that we have the complete payload, look for JSON
@@ -652,31 +717,14 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                         len_str[len_idx] = '\0';
                         print(len_str);
                     }
-                    print(", first 60 bytes: ");
-                    {
-                        int dbg_i;
-                        char *dbg_src = data_response_seen ? g_payload_buffer : read_buffer;
-                        int dbg_len = data_response_seen ? g_payload_pos : buf_pos;
-                        for (dbg_i = 0; dbg_i < 60 && dbg_i < dbg_len; dbg_i++)
-                        {
-                            if (RIA.ready & RIA_READY_TX_BIT)
-                                RIA.tx = dbg_src[dbg_i];
-                        }
-                    }
+                    print(", buffer content shows all bytes stored");
                     print("]\r\n");
 
                     if (data_response_seen && g_payload_pos > 0)
                     {
                         // Use g_payload_buffer (from +DATA: response)
-                        json_start = NULL;
-                        for (i = g_payload_pos - 1; i >= 0; i--)
-                        {
-                            if (g_payload_buffer[i] == '{')
-                            {
-                                json_start = &g_payload_buffer[i];
-                                break;
-                            }
-                        }
+                        // First byte is already confirmed as '{', so use buffer start directly
+                        json_start = &g_payload_buffer[0];
                     }
                     else
                     {
@@ -694,59 +742,9 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     
                     if (json_start)
                     {
-                        // Debug: Print the raw JSON received
-                        print("\r\n[DEBUG: Received JSON: ");
-                        for (i = 0; i < 200 && json_start[i]; i++)
-                        {
-                            if (RIA.ready & RIA_READY_TX_BIT)
-                                RIA.tx = json_start[i];
-                        }
-                        print("]\r\n");
-                        
                         // Try to parse JSON
                         if (parse_json_response(json_start, &msg))
-                        {
-                            print("\r\n[Parsed response ID:");
-                            {
-                                char id_str[12];
-                                int id_idx = 0;
-                                int temp = msg.id;
-                                
-                                if (temp == 0)
-                                    id_str[id_idx++] = '0';
-                                else
-                                {
-                                    char digits[12];
-                                    int d_idx = 0;
-                                    while (temp > 0)
-                                    {
-                                        digits[d_idx++] = '0' + (temp % 10);
-                                        temp /= 10;
-                                    }
-                                    while (d_idx > 0)
-                                        id_str[id_idx++] = digits[--d_idx];
-                                }
-                                id_str[id_idx] = '\0';
-                                print(id_str);
-                            }
-                            print("]\r\n");
-                            
-                            // Debug: show what was parsed
-                            print("[Parsed Category: ");
-                            print(msg.category);
-                            print("]\r\n[Parsed Message (first 20): ");
-                            for (i = 0; i < 20 && msg.base64_message[i]; i++)
-                            {
-                                if (RIA.ready & RIA_READY_TX_BIT)
-                                    RIA.tx = msg.base64_message[i];
-                            }
-                            print("]\r\n[Parsed Hash (first 20): ");
-                            for (i = 0; i < 20 && msg.base64_hash[i]; i++)
-                            {
-                                if (RIA.ready & RIA_READY_TX_BIT)
-                                    RIA.tx = msg.base64_hash[i];
-                            }
-                            print("]\r\n");
+                        {;
                             
                             // Add to queue
                             if (!queue_put(&g_response_queue, &msg))
@@ -761,6 +759,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                         g_payload_pos = 0;
                         g_payload_buffer[0] = '\0';
                         data_response_seen = 0;
+                        payload_found_start = 0;
                     }
                 }
             }
@@ -1032,8 +1031,13 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                     // Move buffer content to start at the data (after colon)
                                     colon++;  // skip the ':'
                                     {
-                                        int src = colon - read_buffer;
-                                        int dst = 0;
+                                        int src;
+                                        int dst;
+                                        src = colon - read_buffer;
+                                        // Skip leading whitespace
+                                        while (src < buf_pos && (read_buffer[src] == '\r' || read_buffer[src] == '\n' || read_buffer[src] == ' ' || read_buffer[src] == '\t'))
+                                            src++;
+                                        dst = 0;
                                         while (src < buf_pos)
                                             read_buffer[dst++] = read_buffer[src++];
                                         buf_pos = dst;
@@ -1066,60 +1070,16 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 
                                 // Mark that we've detected +DATA:
                                 data_response_seen = 1;
+                                payload_found_start = 0;  // Reset so byte-by-byte loop skips leading whitespace
+                                g_payload_pos = 0;        // Reset accumulator for new payload
                                 
-                                // after_data points to ':' after "+DATA"
-                                // We want to start copying from the byte AFTER the ':'
-                                colon = after_data + 1; // points to character after ':'
+                                // Clear read_buffer to stop accumulating header data
+                                // All bytes from now on will go through the payload path with whitespace handling
+                                buf_pos = 0;
+                                read_buffer[0] = '\0';
                                 
-                                // Calculate position of data after colon
-                                data_start_in_buf = colon - read_buffer;
-                                
-                                // Copy any bytes already in buffer after colon to g_payload_buffer
-                                g_payload_pos = 0;
-                                while (data_start_in_buf < buf_pos && g_payload_pos < 1023)
-                                {
-                                    g_payload_buffer[g_payload_pos] = read_buffer[data_start_in_buf];
-                                    g_payload_pos++;
-                                    data_start_in_buf++;
-                                }
-                                g_payload_buffer[g_payload_pos] = '\0';
-                                
-                                // Debug: show what we copied
-                                if (g_payload_pos > 0)
-                                {
-                                    print("(copied ");
-                                    {
-                                        char dbg_str[12];
-                                        int dbg_idx = 0;
-                                        int dbg_temp = g_payload_pos;
-                                        if (dbg_temp == 0)
-                                            dbg_str[dbg_idx++] = '0';
-                                        else
-                                        {
-                                            char dbg_digits[12];
-                                            int dbg_d_idx = 0;
-                                            while (dbg_temp > 0)
-                                            {
-                                                dbg_digits[dbg_d_idx++] = '0' + (dbg_temp % 10);
-                                                dbg_temp /= 10;
-                                            }
-                                            while (dbg_d_idx > 0)
-                                                dbg_str[dbg_idx++] = dbg_digits[--dbg_d_idx];
-                                        }
-                                        dbg_str[dbg_idx] = '\0';
-                                        print(dbg_str);
-                                    }
-                                    print(" bytes: ");
-                                    {
-                                        int dbg_i;
-                                        for (dbg_i = 0; dbg_i < 10 && dbg_i < g_payload_pos; dbg_i++)
-                                        {
-                                            if (RIA.ready & RIA_READY_TX_BIT)
-                                                RIA.tx = g_payload_buffer[dbg_i];
-                                        }
-                                    }
-                                    print(") ");
-                                }
+                                // Don't try to copy initial bytes here - let the main loop handle all accumulation
+                                // The loop below will skip leading whitespace and then accumulate the JSON
                                 
                                 // Calculate how many more bytes we need (use pending_recv_len)
                                 payload_remaining = pending_recv_len - g_payload_pos;
@@ -1149,6 +1109,11 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                     print(len_str);
                                 }
                                 print(" bytes remaining]\r\n");
+                                
+                                // Skip current character processing and restart loop
+                                // This ensures fresh byte-by-byte reads with proper whitespace handling
+                                chars_read++;
+                                continue;
                             }
                             else
                             {
@@ -1229,6 +1194,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                         
                         // Reset the +DATA flag for next response
                         data_response_seen = 0;
+                        payload_found_start = 0;
                     }
                     
                     // Remove processed JSON from buffer
@@ -1529,6 +1495,7 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     pending_recv_len = 0;
                     recv_retry_count = 0;
                     data_response_seen = 0;
+                    payload_found_start = 0;
                     break;
                 }
                 delay_ms(5);
@@ -2204,21 +2171,9 @@ void print_response(ResponseMessage *response)
     print("Category: ");
     print(response->category);
     print("\r\nBase64 Message: ");
-    for (i = 0; i < 60 && response->base64_message[i]; i++)
-    {
-        if (RIA.ready & RIA_READY_TX_BIT)
-            RIA.tx = response->base64_message[i];
-    }
-    if (response->base64_message[60])
-        print("...");
+    print(response->base64_message);
     print("\r\nBase64 Hash: ");
-    for (i = 0; i < 40 && response->base64_hash[i]; i++)
-    {
-        if (RIA.ready & RIA_READY_TX_BIT)
-            RIA.tx = response->base64_hash[i];
-    }
-    if (response->base64_hash[40])
-        print("...");
+    print(response->base64_hash);
     print("\r\n<<< END RESPONSE >>>\r\n");
 }
 
