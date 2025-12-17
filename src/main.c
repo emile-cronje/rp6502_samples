@@ -20,9 +20,9 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 2      // Total number of test messages to send
+#define ITEST_MSG_COUNT 50      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
-#define BATCH_SIZE 25           // Messages per batch
+#define BATCH_SIZE 10           // Messages per batch
 
 #define RESPONSE_BUFFER_SIZE 256
 #define COMMAND_TIMEOUT 10000  // milliseconds
@@ -84,6 +84,7 @@ static int g_payload_pos = 0;
 int parse_number(char *str);
 void delay_ms(int ms);
 void send_to_modem(int fd, char *cmd);
+void print_ram_usage(void);
 
 // Simple string functions
 char* my_strstr(const char *haystack, const char *needle)
@@ -140,6 +141,116 @@ void print(char *s)
     while (*s)
         if (RIA.ready & RIA_READY_TX_BIT)
             RIA.tx = *s++;
+}
+
+// Display RAM usage (shows actual memory used by known data structures and stack)
+void print_ram_usage(void)
+{
+    int used_bytes;
+    int total_bytes;
+    int percentage;
+    
+    /* Calculate memory used by major data structures */
+    used_bytes = 0;
+    
+    /* Response queue: 10 messages * ~595 bytes each */
+    used_bytes += sizeof(g_response_queue);
+    
+    /* Payload buffer */
+    used_bytes += sizeof(g_payload_buffer);
+    
+    /* Message tracker */
+    used_bytes += sizeof(g_sent_tracker);
+    
+    /* Last sent message buffer */
+    used_bytes += sizeof(g_last_sent_msg);
+    
+    /* Estimate total available RAM on RP6502 */
+    total_bytes = 32000;  /* Approximately 32KB available for user code */
+    
+    /* Calculate percentage - use long to avoid 16-bit overflow */
+    if (total_bytes > 0)
+    {
+        long temp_calc;
+        temp_calc = ((long)used_bytes * 100L) / total_bytes;
+        percentage = (int)temp_calc;
+    }
+    else
+        percentage = 0;
+    
+    print("[Static RAM: ");
+    {
+        char used_str[12];
+        char total_str[12];
+        char pct_str[12];
+        int idx;
+        int temp;
+        char digits[12];
+        int d_idx;
+        
+        /* Print used bytes */
+        idx = 0;
+        temp = used_bytes;
+        if (temp == 0)
+            used_str[idx++] = '0';
+        else
+        {
+            d_idx = 0;
+            while (temp > 0)
+            {
+                digits[d_idx++] = '0' + (temp % 10);
+                temp /= 10;
+            }
+            while (d_idx > 0)
+                used_str[idx++] = digits[--d_idx];
+        }
+        used_str[idx] = '\0';
+        print(used_str);
+        
+        print("/");
+        
+        /* Print total bytes */
+        idx = 0;
+        temp = total_bytes;
+        if (temp == 0)
+            total_str[idx++] = '0';
+        else
+        {
+            d_idx = 0;
+            while (temp > 0)
+            {
+                digits[d_idx++] = '0' + (temp % 10);
+                temp /= 10;
+            }
+            while (d_idx > 0)
+                total_str[idx++] = digits[--d_idx];
+        }
+        total_str[idx] = '\0';
+        print(total_str);
+        
+        print("b ");
+        
+        /* Print percentage */
+        idx = 0;
+        temp = percentage;
+        if (temp == 0)
+            pct_str[idx++] = '0';
+        else
+        {
+            d_idx = 0;
+            while (temp > 0)
+            {
+                digits[d_idx++] = '0' + (temp % 10);
+                temp /= 10;
+            }
+            while (d_idx > 0)
+                pct_str[idx++] = digits[--d_idx];
+        }
+        pct_str[idx] = '\0';
+        print(pct_str);
+        
+        print("% used]\r\n");
+    }
 }
 
 // Queue operations
@@ -1919,11 +2030,18 @@ bool validate_received_msg_id(MessageTracker *t, int received_id, int *sent_inde
 void print_response(ResponseMessage *response)
 {
     int i;
-    int sent_idx = -1;
-    bool id_valid = validate_received_msg_id(&g_sent_tracker, response->id, &sent_idx);
-    bool category_match = false;
-    bool message_match = false;
-    bool hash_match = false;
+    int sent_idx;
+    bool id_valid;
+    bool category_match;
+    bool message_match;
+    bool hash_match;
+    
+    sent_idx = -1;
+    category_match = false;
+    message_match = false;
+    hash_match = false;
+    
+    id_valid = validate_received_msg_id(&g_sent_tracker, response->id, &sent_idx);
     
     print("\r\n>>> RESPONSE ARRIVED <<<\r\n");
     print("Received Message ID: ");
@@ -2026,6 +2144,9 @@ void print_response(ResponseMessage *response)
         bool overall_success = category_match && message_match && hash_match;
         tracker_mark_response(&g_sent_tracker, response->id, overall_success);
     }
+    
+    /* Display RAM usage */
+    print_ram_usage();
 }
 
 // Send a message in normal mode using AT+CIPSEND
