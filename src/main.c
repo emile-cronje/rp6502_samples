@@ -20,11 +20,11 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 1      // Total number of test messages to send
+#define ITEST_MSG_COUNT 50      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
-#define BATCH_SIZE 1           // Messages per batch
+#define BATCH_SIZE 10           // Messages per batch
 
-#define RESPONSE_BUFFER_SIZE 512
+#define RESPONSE_BUFFER_SIZE 256
 #define COMMAND_TIMEOUT 10000  // milliseconds
 
 // Response queue for received messages
@@ -53,6 +53,9 @@ typedef struct {
     bool sent;
     bool response_received;
     char timestamp[32];  // For debug output
+    char category[16];
+    char base64_message[512];
+    char base64_hash[64];
 } SentMessageTracker;
 
 typedef struct {
@@ -153,13 +156,30 @@ void tracker_init(MessageTracker *t)
     }
 }
 
-void tracker_mark_sent(MessageTracker *t, int msg_id)
+void tracker_mark_sent(MessageTracker *t, int msg_id, const char *category, const char *base64_msg, const char *base64_hash)
 {
+    int i;
     if (t->count < ITEST_MSG_COUNT)
     {
         t->messages[t->count].id = msg_id;
         t->messages[t->count].sent = true;
         t->messages[t->count].response_received = false;
+        
+        /* Copy category */
+        for (i = 0; i < 15 && category[i]; i++)
+            t->messages[t->count].category[i] = category[i];
+        t->messages[t->count].category[i] = '\0';
+        
+        /* Copy base64 message */
+        for (i = 0; i < 511 && base64_msg[i]; i++)
+            t->messages[t->count].base64_message[i] = base64_msg[i];
+        t->messages[t->count].base64_message[i] = '\0';
+        
+        /* Copy base64 hash */
+        for (i = 0; i < 63 && base64_hash[i]; i++)
+            t->messages[t->count].base64_hash[i] = base64_hash[i];
+        t->messages[t->count].base64_hash[i] = '\0';
+        
         t->count++;
     }
 }
@@ -440,36 +460,6 @@ bool queue_get(ResponseQueue *q, ResponseMessage *msg)
     q->read_idx = (q->read_idx + 1) % RESPONSE_QUEUE_SIZE;
     q->count--;
     
-    // Print the response message being retrieved from queue
-    print("[Queue] Retrieved response - ID: ");
-    {
-        char id_str[12];
-        int id_idx = 0;
-        int temp = msg->id;
-        
-        if (temp == 0)
-            id_str[id_idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                id_str[id_idx++] = digits[--d_idx];
-        }
-        id_str[id_idx] = '\0';
-        print(id_str);
-    }
-    print(", Category: ");
-    print(msg->category);
-    print(", Message: ");
-    print(msg->base64_message);
-    print("\r\n");
-    
     return true;
 }
 
@@ -591,36 +581,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
             // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
             if (payload_remaining > 0)
             {
-                // Debug first byte of payload on first iteration
-                static int payload_first_byte_shown = 0;
-                if (!payload_first_byte_shown && data_response_seen)
-                {
-                    print("[First payload byte (decimal): ");
-                    {
-                        int byte_val = (unsigned char)ch;
-                        char bnum[12];
-                        int bidx = 0;
-                        if (byte_val == 0)
-                            bnum[bidx++] = '0';
-                        else
-                        {
-                            char bdigits[12];
-                            int bd_idx = 0;
-                            int bt = byte_val;
-                            while (bt > 0)
-                            {
-                                bdigits[bd_idx++] = '0' + (bt % 10);
-                                bt /= 10;
-                            }
-                            while (bd_idx > 0)
-                                bnum[bidx++] = bdigits[--bd_idx];
-                        }
-                        bnum[bidx] = '\0';
-                        print(bnum);
-                    }
-                    print("]\r\n");
-                    payload_first_byte_shown = 1;
-                }
                 // If we detected +DATA:, store directly to g_payload_buffer to avoid register issues
                 if (data_response_seen && g_payload_pos < 1023)
                 {
@@ -659,67 +619,11 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                     payload_remaining--;
                 }
                 
-                // Debug: show progress
                 if (payload_remaining == 0)
                 {
-                    print("[Payload complete - received all bytes, data_response_seen=");
-                    if (data_response_seen)
-                        print("1");
-                    else
-                        print("0");
-                    print(", g_payload_pos=");
-                    {
-                        char pnum[12];
-                        int pidx = 0;
-                        int ptemp = g_payload_pos;
-                        if (ptemp == 0)
-                            pnum[pidx++] = '0';
-                        else
-                        {
-                            char pdigits[12];
-                            int pdidx = 0;
-                            while (ptemp > 0)
-                            {
-                                pdigits[pdidx++] = '0' + (ptemp % 10);
-                                ptemp /= 10;
-                            }
-                            while (pdidx > 0)
-                                pnum[pidx++] = pdigits[--pdidx];
-                        }
-                        pnum[pidx] = '\0';
-                        print(pnum);
-                    }
-                    print("]\r\n");
                     pending_recv_len = 0;
                     
                     // Now that we have the complete payload, look for JSON
-                    // Use appropriate buffer based on how we received it
-                    // Debug: dump first bytes of accumulated payload to see corruption
-                    print("[Payload len=");
-                    {
-                        char len_str[12];
-                        int len_idx = 0;
-                        int temp_len = data_response_seen ? g_payload_pos : buf_pos;
-                        if (temp_len == 0)
-                            len_str[len_idx++] = '0';
-                        else
-                        {
-                            char digits[12];
-                            int d_idx = 0;
-                            while (temp_len > 0)
-                            {
-                                digits[d_idx++] = '0' + (temp_len % 10);
-                                temp_len /= 10;
-                            }
-                            while (d_idx > 0)
-                                len_str[len_idx++] = digits[--d_idx];
-                        }
-                        len_str[len_idx] = '\0';
-                        print(len_str);
-                    }
-                    print(", buffer content shows all bytes stored");
-                    print("]\r\n");
-
                     if (data_response_seen && g_payload_pos > 0)
                     {
                         // Use g_payload_buffer (from +DATA: response)
@@ -1086,30 +990,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                                 if (payload_remaining < 0)
                                     payload_remaining = 0;
 
-                                print("[Detected +DATA: - using pending length ");
-                                {
-                                    char len_str[12];
-                                    int len_idx = 0;
-                                    int temp = payload_remaining;
-                                    if (temp == 0)
-                                        len_str[len_idx++] = '0';
-                                    else
-                                    {
-                                        char digits[12];
-                                        int d_idx = 0;
-                                        while (temp > 0)
-                                        {
-                                            digits[d_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        while (d_idx > 0)
-                                            len_str[len_idx++] = digits[--d_idx];
-                                    }
-                                    len_str[len_idx] = '\0';
-                                    print(len_str);
-                                }
-                                print(" bytes remaining]\r\n");
-                                
                                 // Skip current character processing and restart loop
                                 // This ensures fresh byte-by-byte reads with proper whitespace handling
                                 chars_read++;
@@ -1117,7 +997,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
                             }
                             else
                             {
-                                print("[Detected +DATA: - no length info]\r\n");
                                 data_response_seen = 1;
                             }
                             // Don't continue - let the character processing continue normally
@@ -1515,21 +1394,6 @@ int uart_reader_loop(int fd, char *buffer, int buf_size)
         }
     }
     
-    // Debug: print chars received in this iteration
-    if (chunk_idx > 0)
-    {
-        print("[uart_reader_loop recv: ");
-        {
-            int dbg_i;
-            for (dbg_i = 0; dbg_i < chunk_idx; dbg_i++)
-            {
-                if (RIA.ready & RIA_READY_TX_BIT)
-                    RIA.tx = chunk_buf[dbg_i];
-            }
-        }
-        print("]\r\n");
-    }
-
     // Debug: show buffer length after processing
     // print("[Buffer length: ");
     // {
@@ -1954,7 +1818,8 @@ void sha256_simple(const char *input, int input_len, unsigned char *hash)
 
 // Build test message in JSON format with Base64 encoding
 // Returns the message ID
-int build_test_msg(char *msg_text, char *json_output, int max_json_len)
+// Outputs the base64 message and hash in provided buffers
+int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *out_base64_msg, char *out_base64_hash)
 {
     static char base64_msg[512];
     static char base64_hash[64];
@@ -2054,6 +1919,21 @@ int build_test_msg(char *msg_text, char *json_output, int max_json_len)
     
     *p = '\0';
     
+    /* Copy base64 values to output buffers if provided */
+    if (out_base64_msg)
+    {
+        for (i = 0; i < 511 && base64_msg[i]; i++)
+            out_base64_msg[i] = base64_msg[i];
+        out_base64_msg[i] = '\0';
+    }
+    
+    if (out_base64_hash)
+    {
+        for (i = 0; i < 63 && base64_hash[i]; i++)
+            out_base64_hash[i] = base64_hash[i];
+        out_base64_hash[i] = '\0';
+    }
+    
     return msgId;
 }
 
@@ -2134,6 +2014,9 @@ void print_response(ResponseMessage *response)
     int i;
     int sent_idx = -1;
     bool id_valid = validate_received_msg_id(&g_sent_tracker, response->id, &sent_idx);
+    bool category_match = false;
+    bool message_match = false;
+    bool hash_match = false;
     
     print("\r\n>>> RESPONSE ARRIVED <<<\r\n");
     print("Received Message ID: ");
@@ -2159,22 +2042,76 @@ void print_response(ResponseMessage *response)
         id_str[id_idx] = '\0';
         print(id_str);
     }
-    print("\r\nID Comparison: ");
+    
+    /* Compare fields if we found the sent message */
+    if (id_valid && sent_idx >= 0)
+    {
+        /* Compare Category */
+        category_match = true;
+        for (i = 0; response->category[i] || g_sent_tracker.messages[sent_idx].category[i]; i++)
+        {
+            if (response->category[i] != g_sent_tracker.messages[sent_idx].category[i])
+            {
+                category_match = false;
+                break;
+            }
+        }
+        
+        /* Compare Base64 Message */
+        message_match = true;
+        for (i = 0; response->base64_message[i] || g_sent_tracker.messages[sent_idx].base64_message[i]; i++)
+        {
+            if (response->base64_message[i] != g_sent_tracker.messages[sent_idx].base64_message[i])
+            {
+                message_match = false;
+                break;
+            }
+        }
+        
+        /* Compare Base64 Hash */
+        hash_match = true;
+        for (i = 0; response->base64_hash[i] || g_sent_tracker.messages[sent_idx].base64_hash[i]; i++)
+        {
+            if (response->base64_hash[i] != g_sent_tracker.messages[sent_idx].base64_hash[i])
+            {
+                hash_match = false;
+                break;
+            }
+        }
+    }
+    
+    print("\r\n--- Field Comparison Summary ---\r\n");
+    print("ID:       ");
     if (id_valid)
-    {
-        print("PASS - Message ID matches sent message\r\n");
-    }
+        print("OK\r\n");
     else
-    {
-        print("FAIL - Message ID does NOT match any sent message!\r\n");
-    }
+        print("FAILED\r\n");
+    
     print("Category: ");
-    print(response->category);
-    print("\r\nBase64 Message: ");
-    print(response->base64_message);
-    print("\r\nBase64 Hash: ");
-    print(response->base64_hash);
-    print("\r\n<<< END RESPONSE >>>\r\n");
+    if (id_valid && category_match)
+        print("OK\r\n");
+    else if (!id_valid)
+        print("N/A (ID not found)\r\n");
+    else
+        print("FAILED\r\n");
+    
+    print("Message:  ");
+    if (id_valid && message_match)
+        print("OK\r\n");
+    else if (!id_valid)
+        print("N/A (ID not found)\r\n");
+    else
+        print("FAILED\r\n");
+    
+    print("Hash:     ");
+    if (id_valid && hash_match)
+        print("OK\r\n");
+    else if (!id_valid)
+        print("N/A (ID not found)\r\n");
+    else
+        print("FAILED\r\n");
+    
+    print("<<< END RESPONSE >>>\r\n");
 }
 
 // Send a message in normal mode using AT+CIPSEND
@@ -2642,22 +2579,27 @@ void main()
                 // Build formatted message
                 build_formatted_msg(i, TEST_MSG_LENGTH, test_message, 512);
                 
-                // Build JSON message
-                msgId = build_test_msg(test_message, json_message, 1024);
-                
-                print("Sending... ");
-                print(test_message);                
-                
-                // Send message
-                if (send_message(fd, json_message))
+                // Build JSON message and get base64 values
                 {
-                    print("OK\r\n");
-                    // Track this message as sent
-                    tracker_mark_sent(&g_sent_tracker, msgId);
-                }
-                else
-                {
-                    print("FAILED\r\n");
+                    static char sent_base64_msg[512];
+                    static char sent_base64_hash[64];
+                    
+                    msgId = build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash);
+                    
+                    print("Sending... ");
+                    print(test_message);                
+                    
+                    // Send message
+                    if (send_message(fd, json_message))
+                    {
+                        print("OK\r\n");
+                        // Track this message as sent with content
+                        tracker_mark_sent(&g_sent_tracker, msgId, "Test", sent_base64_msg, sent_base64_hash);
+                    }
+                    else
+                    {
+                        print("FAILED\r\n");
+                    }
                 }
                 
                 // After each message, process any responses that have arrived (poll several times)
@@ -2669,32 +2611,9 @@ void main()
                     for (poll = 0; poll < 50; poll++)
                     {
                         int chars_processed = uart_reader_loop(fd, dummy_buf, 256);
-                        // Debug: show how many chars were processed in this iteration
+                        
                         if (chars_processed > 0)
                         {
-                            print("[uart_reader_loop processed ");
-                            {
-                                char count_str[12];
-                                int idx = 0;
-                                int temp = chars_processed;
-                                if (temp == 0)
-                                    count_str[idx++] = '0';
-                                else
-                                {
-                                    char digits[12];
-                                    int d_idx = 0;
-                                    while (temp > 0)
-                                    {
-                                        digits[d_idx++] = '0' + (temp % 10);
-                                        temp /= 10;
-                                    }
-                                    while (d_idx > 0)
-                                        count_str[idx++] = digits[--d_idx];
-                                }
-                                count_str[idx] = '\0';
-                                print(count_str);
-                            }
-                            print(" chars]\r\n");
                             idle_empty = 0;
                         }
                         else
@@ -2833,34 +2752,7 @@ void main()
         // Use uart_reader_loop to process incoming data and parse responses
         {
             static char dummy_buf[256];
-            int chars_processed = uart_reader_loop(fd, dummy_buf, 256);
-            // Debug: show how many chars were processed in this iteration
-            if (chars_processed > 0)
-            {
-                print("[uart_reader_loop processed ");
-                {
-                    char count_str[12];
-                    int idx = 0;
-                    int temp = chars_processed;
-                    if (temp == 0)
-                        count_str[idx++] = '0';
-                    else
-                    {
-                        char digits[12];
-                        int d_idx = 0;
-                        while (temp > 0)
-                        {
-                            digits[d_idx++] = '0' + (temp % 10);
-                            temp /= 10;
-                        }
-                        while (d_idx > 0)
-                            count_str[idx++] = digits[--d_idx];
-                    }
-                    count_str[idx] = '\0';
-                    print(count_str);
-                }
-                print(" chars]\r\n");
-            }
+            uart_reader_loop(fd, dummy_buf, 256);
             
             // Process any queued responses
             {
