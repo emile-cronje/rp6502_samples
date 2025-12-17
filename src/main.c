@@ -20,11 +20,11 @@
 #define SERVER_PORT "8080"
 
 // Test message configuration
-#define ITEST_MSG_COUNT 50      // Total number of test messages to send
+#define ITEST_MSG_COUNT 500      // Total number of test messages to send
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 #define BATCH_SIZE 10           // Messages per batch
 
-#define RESPONSE_BUFFER_SIZE 256
+#define RESPONSE_BUFFER_SIZE 512
 #define COMMAND_TIMEOUT 10000  // milliseconds
 
 // Response queue for received messages
@@ -71,7 +71,7 @@ typedef struct {
 static LastSentMessage g_last_sent_msg;
 
 static MessageTracker g_sent_tracker;
-static time_t g_test_start_time = 0;  /* Unix timestamp when test started */
+static unsigned long g_test_elapsed_ms = 0;  /* Milliseconds elapsed since test start */
 static unsigned int g_test_final_duration_ms = 0;
 static bool g_test_complete = false;
 static bool g_status_printed = false;  /* ensure status prints only once automatically */
@@ -336,9 +336,8 @@ void tracker_print_status(MessageTracker *t)
     int i;
     int missing = 0;
     int received = 0;
+    int compare_failed = 0;
     unsigned int display_duration;
-    time_t current_time;
-    (void)t;  /* Mark parameter as intentionally unused if needed */
     
     if (g_test_complete)
     {
@@ -346,8 +345,23 @@ void tracker_print_status(MessageTracker *t)
     }
     else
     {
-        current_time = time(NULL);
-        display_duration = (unsigned int)(current_time - g_test_start_time) * 1000;  /* Convert seconds to ms */
+        display_duration = (unsigned int)g_test_elapsed_ms;
+    }
+    
+    /* Count received, missing, and failed comparisons */
+    for (i = 0; i < t->count; i++)
+    {
+        if (t->messages[i].sent)
+        {
+            if (t->messages[i].response_received)
+            {
+                received++;
+                if (!t->messages[i].compare_success)
+                    compare_failed++;
+            }
+            else
+                missing++;
+        }
     }
     
     print("\r\n========== Message Tracking Status ==========\r\n");
@@ -374,51 +388,6 @@ void tracker_print_status(MessageTracker *t)
         print(count_str);
     }
     print("\r\n");
-    
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].sent)
-        {
-            if (t->messages[i].response_received)
-                received++;
-            else
-                missing++;
-            
-            print("  ID ");
-            {
-                char id_str[12];
-                int idx = 0;
-                int temp = t->messages[i].id;
-                if (temp == 0)
-                    id_str[idx++] = '0';
-                else
-                {
-                    char digits[12];
-                    int d_idx = 0;
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        id_str[idx++] = digits[--d_idx];
-                }
-                id_str[idx] = '\0';
-                print(id_str);
-            }
-            print(": ");
-            if (t->messages[i].response_received)
-            {
-                print("RECEIVED, COMPARE ");
-                print(t->messages[i].compare_success ? "SUCCESS" : "FAILED");
-            }
-            else
-            {
-                print("PENDING");
-            }
-            print("\r\n");
-        }
-    }
     
     print("Total Received: ");
     {
@@ -486,6 +455,11 @@ void tracker_print_status(MessageTracker *t)
         missing_str[idx] = '\0';
         print(missing_str);
     }
+    print("\r\nCompare: ");
+    if (compare_failed > 0)
+        print("FAILED");
+    else
+        print("SUCCESS");
     print("\r\nTest Duration: ");
     {
         unsigned int total_seconds = display_duration / 1000;  /* Convert to seconds */
@@ -1484,8 +1458,12 @@ void delay_ms(int ms)
     int i, j;
     /* Time tracking is now done via loop counter */
     for (i = 0; i < ms; i++)
+    {
         for (j = 0; j < 100; j++)
             ;
+        if (!g_test_complete)
+            g_test_elapsed_ms++;
+    }
 }
 
 // Read from modem with timeout
@@ -2450,7 +2428,7 @@ void main()
     delay_ms(500);
     
     // Start test timer
-    g_test_start_time = time(NULL);
+    g_test_elapsed_ms = 0;
     
     // Flush any pending data from connection setup
     print("[Flushing initial data...]\r\n");
@@ -2862,8 +2840,7 @@ void main()
             {
                 if (!g_test_complete)
                 {
-                    time_t end_time = time(NULL);
-                    g_test_final_duration_ms = (unsigned int)(end_time - g_test_start_time) * 1000;  /* Convert seconds to ms */
+                    g_test_final_duration_ms = (unsigned int)g_test_elapsed_ms;
                     g_test_complete = true;
                 }
                 if (!g_status_printed)
