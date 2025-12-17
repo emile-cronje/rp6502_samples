@@ -1,92 +1,18 @@
-/*
- * Copyright (c) 2025 Rumbledethumps
- *
- * SPDX-License-Identifier: BSD-3-Clause
- * SPDX-License-Identifier: Unlicense
- */
-
 #include <rp6502.h>
 #include <stdbool.h>
 #include <fcntl.h>
-#include <time.h>
+#include <stdio.h>
+#include <string.h>
 
-// An extremely simple terminal for the Pico RIA W modem.
-// Uses the terminal built in to the Pico VGA.
-
-// WiFi credentials
+#define COMMAND_TIMEOUT 10000  // milliseconds
+#define RESPONSE_BUFFER_SIZE 256
 #define WIFI_SSID "Cudy24G"
 #define WIFI_PASSWORD "ZAnne19991214"
-#define SERVER_IP "192.168.10.250"
-#define SERVER_PORT "8080"
+#define SERVER_IP "192.168.10.174"
+#define SERVER_PORT "1883"
 
-// Test message configuration
-#define ITEST_MSG_COUNT 500      // Total number of test messages to send
-#define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
-#define BATCH_SIZE 10           // Messages per batch
+static int g_tcp_fd = -1;
 
-#define RESPONSE_BUFFER_SIZE 512
-#define COMMAND_TIMEOUT 10000  // milliseconds
-
-// Response queue for received messages
-#define RESPONSE_QUEUE_SIZE 10
-typedef struct {
-    int id;
-    char category[16];
-    char base64_message[512];
-    char base64_hash[64];
-    bool valid;
-} ResponseMessage;
-
-typedef struct {
-    ResponseMessage messages[RESPONSE_QUEUE_SIZE];
-    int write_idx;
-    int read_idx;
-    int count;
-} ResponseQueue;
-
-static ResponseQueue g_response_queue;
-
-// Message tracking for sent/received verification
-#define SENT_MESSAGE_TRACKING_SIZE 50
-typedef struct {
-    int id;
-    bool sent;
-    bool response_received;
-    bool compare_success;
-} SentMessageTracker;
-
-typedef struct {
-    SentMessageTracker messages[ITEST_MSG_COUNT];
-    int count;
-} MessageTracker;
-
-// Buffer to hold last sent message details for comparison
-typedef struct {
-    int id;
-    char category[16];
-    char base64_message[512];
-    char base64_hash[64];
-} LastSentMessage;
-
-static LastSentMessage g_last_sent_msg;
-
-static MessageTracker g_sent_tracker;
-static unsigned long g_test_elapsed_ms = 0;  /* Milliseconds elapsed since test start */
-static unsigned int g_test_final_duration_ms = 0;
-static bool g_test_complete = false;
-static bool g_status_printed = false;  /* ensure status prints only once automatically */
-
-// Global payload buffer for +DATA: response accumulation
-static char g_payload_buffer[1024];
-static int g_payload_pos = 0;
-
-// Forward declarations
-int parse_number(char *str);
-void delay_ms(int ms);
-void send_to_modem(int fd, char *cmd);
-void print_ram_usage(void);
-
-// Simple string functions
 char* my_strstr(const char *haystack, const char *needle)
 {
     const char *h, *n;
@@ -112,6 +38,24 @@ char* my_strstr(const char *haystack, const char *needle)
     }
     
     return NULL;
+}
+
+bool check_response(char *response, const char *expected[], int num_expected)
+{
+    int i;
+
+    /* Treat any ERROR as failure even if OK also appears */
+    if (my_strstr(response, "ERROR") != NULL)
+        return false;
+
+    for (i = 0; i < num_expected; i++)
+    {
+        if (my_strstr(response, expected[i]) != NULL)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 void my_sprintf(char *dest, const char *fmt, const char *s1, const char *s2)
@@ -143,1275 +87,25 @@ void print(char *s)
             RIA.tx = *s++;
 }
 
-// Display RAM usage (shows actual memory used by known data structures and stack)
-void print_ram_usage(void)
-{
-    int used_bytes;
-    int total_bytes;
-    int percentage;
-    
-    /* Calculate memory used by major data structures */
-    used_bytes = 0;
-    
-    /* Response queue: 10 messages * ~595 bytes each */
-    used_bytes += sizeof(g_response_queue);
-    
-    /* Payload buffer */
-    used_bytes += sizeof(g_payload_buffer);
-    
-    /* Message tracker */
-    used_bytes += sizeof(g_sent_tracker);
-    
-    /* Last sent message buffer */
-    used_bytes += sizeof(g_last_sent_msg);
-    
-    /* Estimate total available RAM on RP6502 */
-    total_bytes = 32000;  /* Approximately 32KB available for user code */
-    
-    /* Calculate percentage - use long to avoid 16-bit overflow */
-    if (total_bytes > 0)
-    {
-        long temp_calc;
-        temp_calc = ((long)used_bytes * 100L) / total_bytes;
-        percentage = (int)temp_calc;
-    }
-    else
-        percentage = 0;
-    
-    print("[Static RAM: ");
-    {
-        char used_str[12];
-        char total_str[12];
-        char pct_str[12];
-        int idx;
-        int temp;
-        char digits[12];
-        int d_idx;
-        
-        /* Print used bytes */
-        idx = 0;
-        temp = used_bytes;
-        if (temp == 0)
-            used_str[idx++] = '0';
-        else
-        {
-            d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                used_str[idx++] = digits[--d_idx];
-        }
-        used_str[idx] = '\0';
-        print(used_str);
-        
-        print("/");
-        
-        /* Print total bytes */
-        idx = 0;
-        temp = total_bytes;
-        if (temp == 0)
-            total_str[idx++] = '0';
-        else
-        {
-            d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                total_str[idx++] = digits[--d_idx];
-        }
-        total_str[idx] = '\0';
-        print(total_str);
-        
-        print("b ");
-        
-        /* Print percentage */
-        idx = 0;
-        temp = percentage;
-        if (temp == 0)
-            pct_str[idx++] = '0';
-        else
-        {
-            d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                pct_str[idx++] = digits[--d_idx];
-        }
-        pct_str[idx] = '\0';
-        print(pct_str);
-        
-        print("% used]\r\n");
-    }
-}
-
-// Queue operations
-void queue_init(ResponseQueue *q)
-{
-    q->write_idx = 0;
-    q->read_idx = 0;
-    q->count = 0;
-}
-
-// Message tracker operations
-void tracker_init(MessageTracker *t)
-{
+/* Helper function to copy string to XRAM */
+void xram_strcpy(unsigned int addr, const char* str) {
     int i;
-    t->count = 0;
-    for (i = 0; i < ITEST_MSG_COUNT; i++)
-    {
-        t->messages[i].id = -1;
-        t->messages[i].sent = false;
-        t->messages[i].response_received = false;
+    RIA.addr0 = addr;
+    for (i = 0; str[i]; i++) {
+        RIA.rw0 = str[i];
     }
+    RIA.rw0 = 0;
 }
 
-void tracker_mark_sent(MessageTracker *t, int msg_id, const char *category, const char *base64_msg, const char *base64_hash)
+void delay_ms(int ms)
 {
-    int i;
-    if (t->count < ITEST_MSG_COUNT)
+    int i, j;
+    /* Time tracking is now done via loop counter */
+    for (i = 0; i < ms; i++)
     {
-        t->messages[t->count].id = msg_id;
-        t->messages[t->count].sent = true;
-        t->messages[t->count].response_received = false;
-        t->count++;
+        for (j = 0; j < 100; j++)
+            ;
     }
-    
-    /* Also update the last sent message buffer for comparison */
-    g_last_sent_msg.id = msg_id;
-    
-    /* Copy category */
-    for (i = 0; i < 15 && category[i]; i++)
-        g_last_sent_msg.category[i] = category[i];
-    g_last_sent_msg.category[i] = '\0';
-    
-    /* Copy base64 message */
-    for (i = 0; i < 511 && base64_msg[i]; i++)
-        g_last_sent_msg.base64_message[i] = base64_msg[i];
-    g_last_sent_msg.base64_message[i] = '\0';
-    
-    /* Copy base64 hash */
-    for (i = 0; i < 63 && base64_hash[i]; i++)
-        g_last_sent_msg.base64_hash[i] = base64_hash[i];
-    g_last_sent_msg.base64_hash[i] = '\0';
-}
-
-bool tracker_mark_response(MessageTracker *t, int msg_id, bool compare_success)
-{
-    int i;
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].id == msg_id)
-        {
-            t->messages[i].response_received = true;
-            t->messages[i].compare_success = compare_success;
-            return true;
-        }
-    }
-    return false;  // Message ID not found in sent list
-}
-
-int tracker_get_missing_count(MessageTracker *t)
-{
-    int i;
-    int missing = 0;
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].sent && !t->messages[i].response_received)
-            missing++;
-    }
-    return missing;
-}
-
-void tracker_print_status(MessageTracker *t)
-{
-    int i;
-    int missing = 0;
-    int received = 0;
-    int compare_failed = 0;
-    unsigned int display_duration;
-    
-    if (g_test_complete)
-    {
-        display_duration = g_test_final_duration_ms;
-    }
-    else
-    {
-        display_duration = (unsigned int)g_test_elapsed_ms;
-    }
-    
-    /* Count received, missing, and failed comparisons */
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].sent)
-        {
-            if (t->messages[i].response_received)
-            {
-                received++;
-                if (!t->messages[i].compare_success)
-                    compare_failed++;
-            }
-            else
-                missing++;
-        }
-    }
-    
-    print("\r\n========== Message Tracking Status ==========\r\n");
-    print("Sent Messages: ");
-    {
-        char count_str[12];
-        int idx = 0;
-        int temp = t->count;
-        if (temp == 0)
-            count_str[idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                count_str[idx++] = digits[--d_idx];
-        }
-        count_str[idx] = '\0';
-        print(count_str);
-    }
-    print("\r\n");
-    
-    print("Total Received: ");
-    {
-        char recv_str[12];
-        int idx = 0;
-        int temp = received;
-        if (temp == 0)
-            recv_str[idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                recv_str[idx++] = digits[--d_idx];
-        }
-        recv_str[idx] = '\0';
-        print(recv_str);
-    }
-    print(" / ");
-    {
-        char total_str[12];
-        int idx = 0;
-        int temp = t->count;
-        if (temp == 0)
-            total_str[idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                total_str[idx++] = digits[--d_idx];
-        }
-        total_str[idx] = '\0';
-        print(total_str);
-    }
-    print("\r\nMissing: ");
-    {
-        char missing_str[12];
-        int idx = 0;
-        int temp = missing;
-        if (temp == 0)
-            missing_str[idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                missing_str[idx++] = digits[--d_idx];
-        }
-        missing_str[idx] = '\0';
-        print(missing_str);
-    }
-    print("\r\nCompare: ");
-    if (compare_failed > 0)
-        print("FAILED");
-    else
-        print("SUCCESS");
-    print("\r\nTest Duration: ");
-    {
-        unsigned int total_seconds = display_duration / 1000;  /* Convert to seconds */
-        unsigned int hours = total_seconds / 3600;
-        unsigned int minutes = (total_seconds % 3600) / 60;
-        unsigned int seconds = total_seconds % 60;
-        
-        /* Print hours */
-        {
-            char hour_str[12];
-            int idx = 0;
-            unsigned int temp = hours;
-            if (temp == 0)
-                hour_str[idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    hour_str[idx++] = digits[--d_idx];
-            }
-            hour_str[idx] = '\0';
-            print(hour_str);
-        }
-        print("h ");
-        
-        /* Print minutes */
-        {
-            char min_str[12];
-            int idx = 0;
-            unsigned int temp = minutes;
-            if (temp == 0)
-                min_str[idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    min_str[idx++] = digits[--d_idx];
-            }
-            min_str[idx] = '\0';
-            print(min_str);
-        }
-        print("m ");
-        
-        /* Print seconds */
-        {
-            char sec_str[12];
-            int idx = 0;
-            unsigned int temp = seconds;
-            if (temp == 0)
-                sec_str[idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    sec_str[idx++] = digits[--d_idx];
-            }
-            sec_str[idx] = '\0';
-            print(sec_str);
-        }
-        print("s");
-    }
-    print("\r\n===========================================\r\n");
-}
-
-bool queue_put(ResponseQueue *q, ResponseMessage *msg)
-{
-    if (q->count >= RESPONSE_QUEUE_SIZE)
-        return false;
-    
-    q->messages[q->write_idx] = *msg;
-    q->write_idx = (q->write_idx + 1) % RESPONSE_QUEUE_SIZE;
-    q->count++;
-    return true;
-}
-
-bool queue_get(ResponseQueue *q, ResponseMessage *msg)
-{
-    if (q->count == 0)
-    {
-        return false;        
-    }
-    
-    *msg = q->messages[q->read_idx];
-    q->read_idx = (q->read_idx + 1) % RESPONSE_QUEUE_SIZE;
-    q->count--;
-    
-    return true;
-}
-
-// Parse JSON response from server
-// Expects format: {"Id":<num>,"Category":"<str>","Base64Message":"<str>","Base64MessageHash":"<str>",...}
-bool parse_json_response(char *json, ResponseMessage *msg)
-{
-    char *p = json;
-    char *start;
-    int len;
-    
-    msg->valid = false;
-    msg->id = -1;
-    msg->category[0] = '\0';
-    msg->base64_message[0] = '\0';
-    msg->base64_hash[0] = '\0';
-    
-    // Find "Id":
-    p = my_strstr(json, "\"Id\":");
-    if (p)
-    {
-        p += 5; // skip "Id":
-        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
-        msg->id = parse_number(p);
-    }
-    
-    // Find "Category":
-    p = my_strstr(json, "\"Category\":");
-    if (p)
-    {
-        p += 11; // skip "Category":
-        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
-        if (*p == '"') p++;  // Skip opening quote
-        start = p;
-        len = 0;
-        while (*p && *p != '"' && len < 15)
-        {
-            msg->category[len++] = *p++;
-        }
-        msg->category[len] = '\0';
-    }
-    
-    // Find "Base64Message":
-    p = my_strstr(json, "\"Base64Message\":");
-    if (p)
-    {
-        p += 16; // skip "Base64Message":
-        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
-        if (*p == '"') p++;  // Skip opening quote
-        start = p;
-        len = 0;
-        while (*p && *p != '"' && len < 511)
-        {
-            msg->base64_message[len++] = *p++;
-        }
-        msg->base64_message[len] = '\0';
-    }
-    
-    // Find "Base64MessageHash":
-    p = my_strstr(json, "\"Base64MessageHash\":");
-    if (p)
-    {
-        p += 20; // skip "Base64MessageHash":
-        while (*p == ' ' || *p == '\t') p++;  // Skip whitespace
-        if (*p == '"') p++;  // Skip opening quote
-        start = p;
-        len = 0;
-        while (*p && *p != '"' && len < 63)
-        {
-            msg->base64_hash[len++] = *p++;
-        }
-        msg->base64_hash[len] = '\0';
-    }
-    
-    msg->valid = (msg->id >= 0);
-    return msg->valid;
-}
-
-// UART reader loop - process incoming data and extract responses
-// Returns number of characters processed
-int uart_reader_loop(int fd, char *buffer, int buf_size)
-{
-    static char read_buffer[1024];
-    static char chunk_buf[256];
-    static int buf_pos = 0;
-    static ResponseMessage msg;
-    static int payload_remaining = 0;  // bytes expected after +DATA
-    static int pending_recv_len = 0;   // length announced by +RECV
-    static int recv_retry_count = 0;   // how many times we re-request remaining bytes
-    static int data_response_seen = 0;  // flag to detect +DATA: only once
-    static int payload_found_start = 0;  // flag: have we seen the first '{' yet
-    char ch;
-    int chars_read;
-    int i;
-    char *json_start;
-    int chunk_idx;
-    int idle_loops;
-    
-    chars_read = 0;
-    chunk_idx = 0;
-    idle_loops = 0;
-    (void)buffer;  // unused
-    (void)buf_size;  // unused
-    
-    // Read available characters
-    while (chars_read < 500)  // Limit iterations to prevent blocking
-    {
-        ria_push_char(1);
-        ria_set_ax(fd);
-        if (ria_call_int(RIA_OP_READ_XSTACK))
-        {
-            ch = ria_pop_char();
-            
-            // Echo disabled to avoid any UART side-effects during receive
-            
-            // If we saw a +RECV header earlier, consume exactly payload_remaining bytes
-            if (payload_remaining > 0)
-            {
-                // If we detected +DATA:, store directly to g_payload_buffer to avoid register issues
-                if (data_response_seen && g_payload_pos < 1023)
-                {
-                    // Skip leading whitespace until we find the opening brace
-                    if (!payload_found_start && (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t'))
-                    {
-                        // Skip this whitespace byte, don't count it
-                    }
-                    else
-                    {
-                        payload_found_start = 1;  // Mark that we've started storing real data
-                        // Store the character we already read (ch) - DON'T call ria_pop_char again!
-                        g_payload_buffer[g_payload_pos] = ch;
-                        g_payload_pos++;
-                        g_payload_buffer[g_payload_pos] = '\0';
-                        payload_remaining--;
-                    }
-                }
-                else
-                {
-                    // Store to read_buffer when still looking for +DATA:
-                    if (buf_pos < 1023)
-                    {
-                        read_buffer[buf_pos++] = ch;
-                        read_buffer[buf_pos] = '\0';
-                    }
-                    // Only record chunk debug when not in payload mode
-                    if (payload_remaining == 0 && !data_response_seen)
-                    {
-                        if (chunk_idx < 240)
-                        {
-                            chunk_buf[chunk_idx++] = ch;
-                            chunk_buf[chunk_idx] = '\0';
-                        }
-                    }
-                    payload_remaining--;
-                }
-                
-                if (payload_remaining == 0)
-                {
-                    pending_recv_len = 0;
-                    
-                    // Now that we have the complete payload, look for JSON
-                    if (data_response_seen && g_payload_pos > 0)
-                    {
-                        // Use g_payload_buffer (from +DATA: response)
-                        // First byte is already confirmed as '{', so use buffer start directly
-                        json_start = &g_payload_buffer[0];
-                    }
-                    else
-                    {
-                        // Use read_buffer (old path)
-                        json_start = NULL;
-                        for (i = buf_pos - 1; i >= 0; i--)
-                        {
-                            if (read_buffer[i] == '{')
-                            {
-                                json_start = &read_buffer[i];
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (json_start)
-                    {
-                        // Try to parse JSON
-                        if (parse_json_response(json_start, &msg))
-                        {;
-                            
-                            // Add to queue
-                            if (!queue_put(&g_response_queue, &msg))
-                            {
-                                print("[Warning: Response queue full]\r\n");
-                            }
-                        }
-                        
-                        // Clear the buffer after processing
-                        buf_pos = 0;
-                        read_buffer[0] = '\0';
-                        g_payload_pos = 0;
-                        g_payload_buffer[0] = '\0';
-                        data_response_seen = 0;
-                        payload_found_start = 0;
-                    }
-                }
-            }
-            else
-            {
-                // Add to buffer (header or general data)
-                if (buf_pos < 1023)
-                {
-                    read_buffer[buf_pos++] = ch;
-                    read_buffer[buf_pos] = '\0';
-                }
-                
-                // Debug: Print buffer contents periodically to see what we're receiving
-                if (buf_pos > 0 && buf_pos % 50 == 0)
-                {
-                    print("[Buffer at ");
-                    {
-                        char pos_str[12];
-                        int p_idx = 0;
-                        int temp = buf_pos;
-                        if (temp == 0)
-                            pos_str[p_idx++] = '0';
-                        else
-                        {
-                            char digits[12];
-                            int d_idx = 0;
-                            while (temp > 0)
-                            {
-                                digits[d_idx++] = '0' + (temp % 10);
-                                temp /= 10;
-                            }
-                            while (d_idx > 0)
-                                pos_str[p_idx++] = digits[--d_idx];
-                        }
-                        pos_str[p_idx] = '\0';
-                        print(pos_str);
-                    }
-                    print(": ");
-                    for (i = buf_pos > 30 ? buf_pos - 30 : 0; i < buf_pos; i++)
-                    {
-                        if (RIA.ready & RIA_READY_TX_BIT)
-                            RIA.tx = read_buffer[i];
-                    }
-                    print("]\r\n");
-                }
-                
-                // Record into chunk buffer for debug print
-                if (chunk_idx < 240)
-                {
-                    chunk_buf[chunk_idx++] = ch;
-                    chunk_buf[chunk_idx] = '\0';
-                }
-                
-                // Detect +IPD header for incoming data (ESP8266 single connection mode)
-                // Format: "+IPD,<len>:<data>" 
-                if (buf_pos >= 10)
-                {
-                    char *ipd_start = my_strstr(read_buffer, "+IPD,");
-                    if (ipd_start)
-                    {
-                        // Find the colon that separates length from data
-                        char *colon = ipd_start + 5;  // skip "+IPD,"
-                        while (*colon && *colon != ':')
-                            colon++;
-                        
-                        // Only parse if we found the colon
-                        if (*colon == ':')
-                        {
-                            int len = parse_number(ipd_start + 5);
-                            if (len > 0)
-                            {
-                                print("[Detected +IPD with ");
-                                {
-                                    char len_str[12];
-                                    int len_idx = 0;
-                                    int temp = len;
-                                    if (temp == 0)
-                                        len_str[len_idx++] = '0';
-                                    else
-                                    {
-                                        char digits[12];
-                                        int d_idx = 0;
-                                        while (temp > 0)
-                                        {
-                                            digits[d_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        while (d_idx > 0)
-                                            len_str[len_idx++] = digits[--d_idx];
-                                    }
-                                    len_str[len_idx] = '\0';
-                                    print(len_str);
-                                }
-                                print(" bytes expected]\r\n");
-                                // Don't reset chunk_idx - we want to see everything for debug
-                                // Reset read buffer to store only payload (starts after the ':')
-                                buf_pos = 0;
-                                read_buffer[0] = '\0';
-                                payload_remaining = len;
-                                // Don't break - continue reading to get the payload
-                                chars_read++;
-                                idle_loops = 0;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                
-                // Also check for +RECV (notification only - need AT+CIPRECVDATA to retrieve)
-                // ESP8266 sends: "+RECV:nnn\r\n" as notification
-                if (buf_pos >= 10)
-                {
-                    char *recv_start = my_strstr(read_buffer, "+RECV:");
-                    if (recv_start)
-                    {
-                        // Find the \r or \n that ends the +RECV line
-                        char *line_end = recv_start + 6;  // skip "+RECV:"
-                        while (*line_end && *line_end != '\r' && *line_end != '\n')
-                            line_end++;
-                        
-                        // Only parse if we found the line terminator
-                        if (*line_end == '\r' || *line_end == '\n')
-                        {
-                            int len = parse_number(recv_start + 6);
-                            if (len > 0)
-                            {
-                                static char recv_cmd[32];
-                                int cmd_idx = 0;
-
-                                // Remember how many bytes the modem announced
-                                pending_recv_len = len;
-                                
-                                // print("[Detected +RECV with ");
-                                // {
-                                //     char len_str[12];
-                                //     int len_idx = 0;
-                                //     int temp = len;
-                                //     if (temp == 0)
-                                //         len_str[len_idx++] = '0';
-                                //     else
-                                //     {
-                                //         char digits[12];
-                                //         int d_idx = 0;
-                                //         while (temp > 0)
-                                //         {
-                                //             digits[d_idx++] = '0' + (temp % 10);
-                                //             temp /= 10;
-                                //         }
-                                //         while (d_idx > 0)
-                                //             len_str[len_idx++] = digits[--d_idx];
-                                //     }
-                                //     len_str[len_idx] = '\0';
-                                //     print(len_str);
-                                // }
-                                // print(" bytes - sending AT+CIPRECVDATA]\r\n");
-
-                                recv_retry_count = 0;  // reset retries for this payload
-                                
-                                // Build AT+CIPRECVDATA=<len> command
-                                recv_cmd[cmd_idx++] = 'A';
-                                recv_cmd[cmd_idx++] = 'T';
-                                recv_cmd[cmd_idx++] = '+';
-                                recv_cmd[cmd_idx++] = 'C';
-                                recv_cmd[cmd_idx++] = 'I';
-                                recv_cmd[cmd_idx++] = 'P';
-                                recv_cmd[cmd_idx++] = 'R';
-                                recv_cmd[cmd_idx++] = 'E';
-                                recv_cmd[cmd_idx++] = 'C';
-                                recv_cmd[cmd_idx++] = 'V';
-                                recv_cmd[cmd_idx++] = 'D';
-                                recv_cmd[cmd_idx++] = 'A';
-                                recv_cmd[cmd_idx++] = 'T';
-                                recv_cmd[cmd_idx++] = 'A';
-                                recv_cmd[cmd_idx++] = '=';
-                                
-                                // Add length
-                                {
-                                    char len_str[12];
-                                    int len_idx = 0;
-                                    int temp = len;
-                                    if (temp == 0)
-                                        len_str[len_idx++] = '0';
-                                    else
-                                    {
-                                        char digits[12];
-                                        int d_idx = 0;
-                                        while (temp > 0)
-                                        {
-                                            digits[d_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        while (d_idx > 0)
-                                            len_str[len_idx++] = digits[--d_idx];
-                                    }
-                                    len_str[len_idx] = '\0';
-                                    
-                                    // Copy to command
-                                    {
-                                        int li = 0;
-                                        while (len_str[li])
-                                            recv_cmd[cmd_idx++] = len_str[li++];
-                                    }
-                                }
-                                recv_cmd[cmd_idx] = '\0';
-                                
-                                // Send the command to retrieve data
-                                send_to_modem(fd, recv_cmd);
-                                print(recv_cmd);
-                                
-                                // Clear buffer to receive +DATA response
-                                // DON'T set payload_remaining yet - wait for +DATA response
-                                buf_pos = 0;
-                                read_buffer[0] = '\0';
-                                chars_read++;
-                                idle_loops = 0;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                
-                // Check for +DATA: (response to AT+CIPRECVDATA)
-                // Format: "+DATA,<len>:<actual_data>" OR just "+DATA:<actual_data>"
-                if (buf_pos >= 6)
-                {
-                    char *data_start = my_strstr(read_buffer, "+DATA");
-                    if (data_start)
-                    {
-                        char *after_data = data_start + 5;  // skip "+DATA"
-                        
-                        // Check if there's a comma (format: +DATA,<len>:data)
-                        if (*after_data == ',')
-                        {
-                            // Find the colon that separates length from data
-                            char *colon = after_data + 1;  // skip ","
-                            while (*colon && *colon != ':')
-                                colon++;
-                            
-                            // Only parse if we found the colon
-                            if (*colon == ':')
-                            {
-                                int len = parse_number(after_data + 1);
-                                if (len > 0)
-                                {
-                                    print("[Detected +DATA, with ");
-                                    {
-                                        char len_str[12];
-                                        int len_idx = 0;
-                                        int temp = len;
-                                        if (temp == 0)
-                                            len_str[len_idx++] = '0';
-                                        else
-                                        {
-                                            char digits[12];
-                                            int d_idx = 0;
-                                            while (temp > 0)
-                                            {
-                                                digits[d_idx++] = '0' + (temp % 10);
-                                                temp /= 10;
-                                            }
-                                            while (d_idx > 0)
-                                                len_str[len_idx++] = digits[--d_idx];
-                                        }
-                                        len_str[len_idx] = '\0';
-                                        print(len_str);
-                                    }
-                                    print(" bytes]\r\n");
-                                    
-                                    // Move buffer content to start at the data (after colon)
-                                    colon++;  // skip the ':'
-                                    {
-                                        int src;
-                                        int dst;
-                                        src = colon - read_buffer;
-                                        // Skip leading whitespace
-                                        while (src < buf_pos && (read_buffer[src] == '\r' || read_buffer[src] == '\n' || read_buffer[src] == ' ' || read_buffer[src] == '\t'))
-                                            src++;
-                                        dst = 0;
-                                        while (src < buf_pos)
-                                            read_buffer[dst++] = read_buffer[src++];
-                                        buf_pos = dst;
-                                        read_buffer[buf_pos] = '\0';
-                                    }
-                                    
-                                    // Calculate how many more bytes we need
-                                    payload_remaining = len - buf_pos;
-                                    chars_read++;
-                                    idle_loops = 0;
-                                    
-                                    // If complete payload already in buffer, process immediately
-                                    if (payload_remaining <= 0)
-                                    {
-                                        print("[+DATA payload complete]\r\n");
-                                        payload_remaining = 0;
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                        // Check if there's a colon directly (format: +DATA:data without length)
-                        else if (*after_data == ':' && !data_response_seen)
-                        {
-                            // Try to use pending_recv_len to know expected bytes
-                            if (pending_recv_len > 0)
-                            {
-                                
-                                // Mark that we've detected +DATA:
-                                data_response_seen = 1;
-                                payload_found_start = 0;  // Reset so byte-by-byte loop skips leading whitespace
-                                g_payload_pos = 0;        // Reset accumulator for new payload
-                                
-                                // Clear read_buffer to stop accumulating header data
-                                // All bytes from now on will go through the payload path with whitespace handling
-                                buf_pos = 0;
-                                read_buffer[0] = '\0';
-                                
-                                // Don't try to copy initial bytes here - let the main loop handle all accumulation
-                                // The loop below will skip leading whitespace and then accumulate the JSON
-                                
-                                // Calculate how many more bytes we need (use pending_recv_len)
-                                payload_remaining = pending_recv_len - g_payload_pos;
-                                if (payload_remaining < 0)
-                                    payload_remaining = 0;
-
-                                // Skip current character processing and restart loop
-                                // This ensures fresh byte-by-byte reads with proper whitespace handling
-                                chars_read++;
-                                continue;
-                            }
-                            else
-                            {
-                                data_response_seen = 1;
-                            }
-                            // Don't continue - let the character processing continue normally
-                        }
-                    }
-                }
-            }
-            
-            chars_read++;
-            idle_loops = 0;  // reset idle counter on successful read
-            
-            // Prevent buffer overflow - keep only last 512 chars
-            if (buf_pos > 800)
-            {
-                int keep = 512;
-                for (i = 0; i < keep; i++)
-                    read_buffer[i] = read_buffer[buf_pos - keep + i];
-                buf_pos = keep;
-                read_buffer[buf_pos] = '\0';
-            }
-        }
-        else
-        {
-            // No data this call; handle based on whether we're expecting payload
-            if (payload_remaining > 0)
-            {
-                int temp;
-                char rem_str[12];
-                int rem_idx;
-                static char cmd[32];
-                int cmd_idx;
-                char len_str[12];
-                int len_idx;
-                char digits[12];
-                
-                // We're waiting for payload bytes - keep trying with small delay
-                idle_loops++;
-                if (idle_loops > 2000)
-                {
-                    // Try re-requesting remaining bytes up to 3 times
-                    if (recv_retry_count < 3 && payload_remaining > 0)
-                    {
-                        recv_retry_count++;
-                        print("[Re-requesting remaining bytes: ");
-                        rem_idx = 0;
-                        temp = payload_remaining;
-                        if (temp == 0)
-                            rem_str[rem_idx++] = '0';
-                        else
-                        {
-                            while (temp > 0)
-                            {
-                                digits[rem_idx++] = '0' + (temp % 10);
-                                temp /= 10;
-                            }
-                            while (rem_idx > 0)
-                                rem_str[rem_idx - 1] = digits[--rem_idx];
-                            rem_idx = 0;
-                            temp = payload_remaining;
-                            while (temp > 0)
-                            {
-                                digits[rem_idx++] = '0' + (temp % 10);
-                                temp /= 10;
-                            }
-                            len_idx = 0;
-                            while (rem_idx > 0)
-                                rem_str[len_idx++] = digits[--rem_idx];
-                            rem_str[len_idx] = '\0';
-                        }
-                        rem_str[rem_idx == 0 ? 1 : rem_idx] = '\0';
-                        print(rem_str);
-                        print("]\r\n");
-                        
-                        // Build AT+CIPRECVDATA=<remaining>
-                        cmd_idx = 0;
-                        cmd[cmd_idx++] = 'A';
-                        cmd[cmd_idx++] = 'T';
-                        cmd[cmd_idx++] = '+';
-                        cmd[cmd_idx++] = 'C';
-                        cmd[cmd_idx++] = 'I';
-                        cmd[cmd_idx++] = 'P';
-                        cmd[cmd_idx++] = 'R';
-                        cmd[cmd_idx++] = 'E';
-                        cmd[cmd_idx++] = 'C';
-                        cmd[cmd_idx++] = 'V';
-                        cmd[cmd_idx++] = 'D';
-                        cmd[cmd_idx++] = 'A';
-                        cmd[cmd_idx++] = 'T';
-                        cmd[cmd_idx++] = 'A';
-                        cmd[cmd_idx++] = '=';
-                        
-                        // remaining length as string
-                        len_idx = 0;
-                        temp = payload_remaining;
-                        if (temp == 0)
-                            len_str[len_idx++] = '0';
-                        else
-                        {
-                            while (temp > 0)
-                            {
-                                digits[len_idx++] = '0' + (temp % 10);
-                                temp /= 10;
-                            }
-                            while (len_idx > 0)
-                                len_str[len_idx - 1] = digits[--len_idx];
-                            len_idx = 0;
-                            temp = payload_remaining;
-                            while (temp > 0)
-                            {
-                                digits[len_idx++] = '0' + (temp % 10);
-                                temp /= 10;
-                            }
-                            while (len_idx > 0)
-                                len_str[len_idx - 1] = digits[--len_idx];
-                        }
-                        len_str[len_idx] = '\0';
-                        {
-                            int li = 0;
-                            while (len_str[li])
-                                cmd[cmd_idx++] = len_str[li++];
-                        }
-                        cmd[cmd_idx] = '\0';
-                        send_to_modem(fd, cmd);
-                        idle_loops = 0;
-                        continue;
-                    }
-                    
-                    print("[Timeout waiting for payload - expected ");
-                    rem_idx = 0;
-                    temp = payload_remaining;
-                    if (temp == 0)
-                        rem_str[rem_idx++] = '0';
-                    else
-                    {
-                        while (temp > 0)
-                        {
-                            digits[rem_idx++] = '0' + (temp % 10);
-                            temp /= 10;
-                        }
-                        len_idx = 0;
-                        while (rem_idx > 0)
-                            rem_str[len_idx++] = digits[--rem_idx];
-                    }
-                    rem_str[len_idx] = '\0';
-                    print(rem_str);
-                    print(" more bytes]\r\n");
-                    
-                    /* Try to salvage: search for complete JSON in buffer */
-                    print("[Searching buffer for JSON, buf_pos=");
-                    {
-                        char pos_str[12];
-                        int pos_idx = 0;
-                        temp = buf_pos;
-                        if (temp == 0)
-                            pos_str[pos_idx++] = '0';
-                        else
-                        {
-                            while (temp > 0)
-                            {
-                                digits[pos_idx++] = '0' + (temp % 10);
-                                temp /= 10;
-                            }
-                            len_idx = 0;
-                            while (pos_idx > 0)
-                                pos_str[len_idx++] = digits[--pos_idx];
-                            pos_str[len_idx] = '\0';
-                        }
-                        print(pos_str);
-                    }
-                    print("]\r\n");
-                    
-                    if (buf_pos > 10)
-                    {
-                        int found_brace = 0;
-                        char *json_start_ptr = NULL;
-                        int j;
-                        for (i = buf_pos - 1; i >= 0; i--)
-                        {
-                            if (read_buffer[i] == '}')
-                            {
-                                found_brace = 1;
-                                print("[Found closing brace at position ");
-                                {
-                                    char brace_str[12];
-                                    int brace_idx = 0;
-                                    temp = i;
-                                    if (temp == 0)
-                                        brace_str[brace_idx++] = '0';
-                                    else
-                                    {
-                                        while (temp > 0)
-                                        {
-                                            digits[brace_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        len_idx = 0;
-                                        while (brace_idx > 0)
-                                            brace_str[len_idx++] = digits[--brace_idx];
-                                        brace_str[len_idx] = '\0';
-                                    }
-                                    print(brace_str);
-                                }
-                                print("]\r\n");
-                                
-                                for (j = i - 1; j >= 0; j--)
-                                {
-                                    if (read_buffer[j] == '{')
-                                    {
-                                        json_start_ptr = &read_buffer[j];
-                                        print("[Found opening brace at position ");
-                                        {
-                                            char open_str[12];
-                                            int open_idx = 0;
-                                            temp = j;
-                                            if (temp == 0)
-                                                open_str[open_idx++] = '0';
-                                            else
-                                            {
-                                                while (temp > 0)
-                                                {
-                                                    digits[open_idx++] = '0' + (temp % 10);
-                                                    temp /= 10;
-                                                }
-                                                len_idx = 0;
-                                                while (open_idx > 0)
-                                                    open_str[len_idx++] = digits[--open_idx];
-                                                open_str[len_idx] = '\0';
-                                            }
-                                            print(open_str);
-                                        }
-                                        print("]\r\n");
-                                        break;
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                        
-                        if (!found_brace)
-                        {
-                            print("[No closing brace - trying to parse incomplete JSON]\r\n");
-                            /* Search for opening brace even without closing */
-                            for (j = 0; j < buf_pos; j++)
-                            {
-                                if (read_buffer[j] == '{')
-                                {
-                                    json_start_ptr = &read_buffer[j];
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        if (json_start_ptr)
-                        {
-                            print("[Attempting to parse incomplete JSON]\r\n");
-                            if (parse_json_response(json_start_ptr, &msg))
-                            {
-                                print("[Parsed partial response ID:");
-                                {
-                                    char id_str[12];
-                                    int id_idx = 0;
-                                    temp = msg.id;
-                                    if (temp == 0)
-                                        id_str[id_idx++] = '0';
-                                    else
-                                    {
-                                        while (temp > 0)
-                                        {
-                                            digits[id_idx++] = '0' + (temp % 10);
-                                            temp /= 10;
-                                        }
-                                        len_idx = 0;
-                                        while (id_idx > 0)
-                                            id_str[len_idx++] = digits[--id_idx];
-                                        id_str[len_idx] = '\0';
-                                    }
-                                    print(id_str);
-                                }
-                                print("]\r\n");
-                                
-                                if (!queue_put(&g_response_queue, &msg))
-                                {
-                                    print("[Queue full]\r\n");
-                                }
-                            }
-                        }
-                    }
-                    
-                    payload_remaining = 0;  // reset
-                    pending_recv_len = 0;
-                    recv_retry_count = 0;
-                    data_response_seen = 0;
-                    payload_found_start = 0;
-                    break;
-                }
-                delay_ms(5);
-            }
-            else if (chars_read > 0)
-            {
-                // We read header/data but not expecting payload - short idle wait
-                idle_loops++;
-                if (idle_loops > 100)
-                    break;  // stop after ~500ms idle gap once we read something
-                delay_ms(5);
-            }
-            else
-            {
-                break;  // nothing read yet, exit immediately
-            }
-        }
-    }
-    
-    // Debug: show buffer length after processing
-    // Removed: debug code was here
-    
-    return chars_read;
 }
 
 // Send a string to the modem
@@ -1436,37 +130,6 @@ void send_to_modem(int fd, char *cmd)
         ;
 }
 
-// Send raw data without line terminators (for CIPSEND payload)
-// Send entire message as fast as possible
-void send_raw_data(int fd, char *data, int length)
-{
-    int i;
-    
-    // Send all bytes as quickly as possible without delays
-    for (i = 0; i < length; i++)
-    {
-        ria_push_char(data[i]);
-        ria_set_ax(fd);
-        while (!ria_call_int(RIA_OP_WRITE_XSTACK))
-            ;
-    }
-}
-
-// Simple delay function
-void delay_ms(int ms)
-{
-    int i, j;
-    /* Time tracking is now done via loop counter */
-    for (i = 0; i < ms; i++)
-    {
-        for (j = 0; j < 100; j++)
-            ;
-        if (!g_test_complete)
-            g_test_elapsed_ms++;
-    }
-}
-
-// Read from modem with timeout
 bool read_modem_response(int fd, char *buffer, int max_len, int timeout_ms)
 {
     int idx = 0;
@@ -1505,30 +168,6 @@ bool read_modem_response(int fd, char *buffer, int max_len, int timeout_ms)
     return idx > 0;
 }
 
-// Check if response contains any of the expected strings
-bool check_response(char *response, const char *expected[], int num_expected)
-{
-    int i;
-
-    /* Treat any ERROR as failure even if OK also appears */
-    if (my_strstr(response, "ERROR") != NULL)
-        return false;
-
-    for (i = 0; i < num_expected; i++)
-    {
-        if (my_strstr(response, expected[i]) != NULL)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Forward declaration
-int parse_number(char *str);
-
-
-// Send AT command and wait for expected response
 bool send_at_command(int fd, char *cmd, const char *expected[], int num_expected)
 {
     static char response[RESPONSE_BUFFER_SIZE];
@@ -1571,7 +210,6 @@ bool send_at_command(int fd, char *cmd, const char *expected[], int num_expected
     }
 }
 
-// Send AT command with longer timeout (for WiFi connect)
 bool send_at_command_long(int fd, char *cmd, const char *expected[], int num_expected)
 {
     static char response[RESPONSE_BUFFER_SIZE];
@@ -1607,7 +245,6 @@ bool send_at_command_long(int fd, char *cmd, const char *expected[], int num_exp
     }
 }
 
-// Initialize WiFi connection
 bool init_wifi(int fd)
 {
     static char cmd[128];
@@ -1620,6 +257,7 @@ bool init_wifi(int fd)
     // AT - Test command
     if (!send_at_command(fd, "AT", ok_resp, 1))
         return false;
+
     delay_ms(500);
     
     // ATE0 - Disable echo
@@ -1630,26 +268,30 @@ bool init_wifi(int fd)
     // AT+CWJAP - Join access point (can take 10-15 seconds)
     print("Connecting to WiFi (may take 15+ seconds)...\r\n");
     my_sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", WIFI_SSID, WIFI_PASSWORD);
+
     if (!send_at_command_long(fd, cmd, connect_resp, 3))
         return false;
+
     delay_ms(2000);  // Wait after connection
     
     // AT+CIFSR - Get IP address
-    if (!send_at_command(fd, "AT+CIFSR", ok_resp, 1))
-        return false;
+//    if (!send_at_command(fd, "AT+CIFSR", ok_resp, 1))
+  //      return false;
     
     // AT+CIPMUX=0 - Single connection mode
-    if (!send_at_command(fd, "AT+CIPMUX=0", ok_resp, 1))
-        return false;
+  //  if (!send_at_command(fd, "AT+CIPMUX=0", ok_resp, 1))
+    //    return false;
     
     // AT+CIPRECVMODE=0 - Active receive mode (data pushed via +IPD)
     // This may fail on some firmware - continue even if it errors
-    send_at_command(fd, "AT+CIPRECVMODE=0", ok_resp, 1);
+//    send_at_command(fd, "AT+CIPRECVMODE=0", ok_resp, 1);
     
     // AT+CIPSTART - Start TCP connection
     my_sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", SERVER_IP, SERVER_PORT);
+
     if (!send_at_command(fd, cmd, tcp_resp, 3))
         return false;
+
     delay_ms(2000);  // Wait for connection to establish and stabilize
     
     // In normal mode, we use AT+CIPSEND for reliable message delivery
@@ -1659,1202 +301,242 @@ bool init_wifi(int fd)
     return true;
 }
 
-// Simple JSON parser - extract Id field
-int parse_msg_id(char *json_str)
-{
-    char *p;
-    p = json_str;
-    while (*p)
-    {
-        // Look for "Id"
-        if (p[0] == '"' && p[1] == 'I' && p[2] == 'd' && p[3] == '"')
-        {
-            // Skip to colon and value
-            p += 4;
-            while (*p && *p != ':')
-                p++;
-            if (*p == ':')
-            {
-                p++;
-                while (*p && (*p == ' ' || *p == '\t'))
-                    p++;
-                // Parse number
-                return parse_number(p);
-            }
-        }
-        p++;
-    }
-    return -1;
-}
+int main() {
+    char broker[] = SERVER_IP;
+    char client_id[] = "rp6502_demo";
+    unsigned int port = 1883;
+    char sub_topic[] = "rp6502/demo/#";
+    unsigned int sub_len;
+    char topic1[] = "rp6502/demo/temperature";
+    char payload1[] = "22.5 C";
+    char topic2[] = "rp6502/demo/humidity";
+    char payload2[] = "65%";
+    char status_topic[] = "rp6502/demo/status";
+    char status_payload[] = "online";
+    int msg_count = 0;
+    int i, j;
+    volatile long k;
+    unsigned int msg_len, topic_len, bytes_read;
+    
+    print("=== Complete MQTT Example ===\n\n");
+    
+    /* STEP 1: Connect to WiFi */
+    print("[1/6] Connecting to WiFi...\n");
+    g_tcp_fd = open("AT:", 0);    
 
-// Simple number parser
-int parse_number(char *str)
-{
-    int result = 0;
-    while (*str >= '0' && *str <= '9')
-    {
-        result = result * 10 + (*str - '0');
-        str++;
-    }
-    return result;
-}
+    print("Waiting for WiFi connection...\n");
 
-// Read a message from modem and parse it
-bool receive_message(int fd, char *buffer, int max_len)
-{
-    static char response[RESPONSE_BUFFER_SIZE];
-    char *json_start;
-    char *json_end;
-    int len;
-    int i;
-    int msg_id;
-    char id_str[16];
-    int temp;
-    int idx;
-    
-    if (read_modem_response(fd, response, RESPONSE_BUFFER_SIZE, 3000))
-    {
-        // Look for JSON object in response
-        json_start = my_strstr(response, "{");
-        json_end = my_strstr(response, "}");
-        
-        if (json_start && json_end && json_end > json_start)
-        {
-            len = (int)(json_end - json_start) + 1;
-            if (len > max_len)
-                len = max_len;
-            
-            for (i = 0; i < len; i++)
-                buffer[i] = json_start[i];
-            buffer[len] = '\0';
-            
-            print("Received message (ID: ");
-            msg_id = parse_msg_id(buffer);
-            if (msg_id >= 0)
-            {
-                // Print message ID (simplified - just print number)
-                temp = msg_id;
-                idx = 0;
-                if (temp == 0)
-                    id_str[idx++] = '0';
-                else
-                {
-                    char digits[16];
-                    int d_idx = 0;
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        id_str[idx++] = digits[--d_idx];
-                }
-                id_str[idx] = '\0';
-                print(id_str);
-            }
-            print(")\r\n");
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-// Global message ID counter
-static int g_msgId = 1;
-
-// Base64 encoding table
-static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-// Simple Base64 encoder
-void base64_encode(const char *input, int input_len, char *output)
-{
-    int i;
-    unsigned char a, b, c;
-    int out_idx = 0;
-    
-    for (i = 0; i < input_len; i += 3)
-    {
-        a = input[i];
-        b = (i + 1 < input_len) ? input[i + 1] : 0;
-        c = (i + 2 < input_len) ? input[i + 2] : 0;
-        
-        output[out_idx++] = base64_table[a >> 2];
-        output[out_idx++] = base64_table[((a & 0x03) << 4) | (b >> 4)];
-        output[out_idx++] = (i + 1 < input_len) ? base64_table[((b & 0x0F) << 2) | (c >> 6)] : '=';
-        output[out_idx++] = (i + 2 < input_len) ? base64_table[c & 0x3F] : '=';
-    }
-    
-    output[out_idx] = '\0';
-}
-
-// Simple SHA256 implementation (simplified for embedded use)
-// Note: This is a basic implementation. For production, use a proper crypto library.
-void sha256_simple(const char *input, int input_len, unsigned char *hash)
-{
-    // For simplicity, we'll use a basic checksum instead of full SHA256
-    // A full SHA256 implementation would be quite large for cc65
-    int i;
-    unsigned long sum = 0x5A5A5A5AL;  // seed
-    
-    for (i = 0; i < input_len; i++)
-    {
-        sum = ((sum << 5) + sum) + (unsigned char)input[i];
-        sum ^= (sum >> 16);
-    }
-    
-    // Generate 32 bytes of "hash" from the checksum
-    for (i = 0; i < 32; i++)
-    {
-        hash[i] = (unsigned char)((sum >> ((i % 4) * 8)) & 0xFF);
-        if (i % 4 == 3)
-            sum = ((sum << 7) ^ (sum >> 11)) + input[i % input_len];
-    }
-}
-
-// Build test message in JSON format with Base64 encoding
-// Returns the message ID
-// Outputs the base64 message and hash in provided buffers
-int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *out_base64_msg, char *out_base64_hash)
-{
-    static char base64_msg[512];
-    static char base64_hash[64];
-    static unsigned char hash[32];
-    int msg_len;
-    int msgId;
-    char *p;
-    int i;
-    char id_str[12];
-    int id_idx;
-    
-    // Get message length
-    msg_len = 0;
-    p = msg_text;
-    while (*p)
-    {
-        msg_len++;
-        p++;
-    }
-    
-    // Calculate hash
-    sha256_simple(msg_text, msg_len, hash);
-    
-    // Base64 encode message
-    base64_encode(msg_text, msg_len, base64_msg);
-    
-    // Base64 encode hash
-    base64_encode((char*)hash, 32, base64_hash);
-    
-    // Get next message ID
-    msgId = g_msgId++;
-    
-    // Convert msgId to string
-    id_idx = 0;
-    if (msgId == 0)
-    {
-        id_str[id_idx++] = '0';
-    }
-    else
-    {
-        char digits[12];
-        int d_idx = 0;
-        int temp = msgId;
-        
-        while (temp > 0)
-        {
-            digits[d_idx++] = '0' + (temp % 10);
-            temp /= 10;
-        }
-        while (d_idx > 0)
-            id_str[id_idx++] = digits[--d_idx];
-    }
-    id_str[id_idx] = '\0';
-    
-    // Build JSON string manually
-    p = json_output;
-    
-    // {"Id":
-    *p++ = '{'; *p++ = '"'; *p++ = 'I'; *p++ = 'd'; *p++ = '"'; *p++ = ':';
-    
-    // <msgId>
-    i = 0;
-    while (id_str[i])
-        *p++ = id_str[i++];
-    
-    // ,"Category":"Test"
-    *p++ = ','; *p++ = '"'; *p++ = 'C'; *p++ = 'a'; *p++ = 't'; *p++ = 'e';
-    *p++ = 'g'; *p++ = 'o'; *p++ = 'r'; *p++ = 'y'; *p++ = '"'; *p++ = ':';
-    *p++ = '"'; *p++ = 'T'; *p++ = 'e'; *p++ = 's'; *p++ = 't'; *p++ = '"';
-    
-    // ,"Base64Message":"
-    *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's'; *p++ = 'e';
-    *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
-    *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = '"'; *p++ = ':'; *p++ = '"';
-    
-    // <base64_msg>
-    i = 0;
-    while (base64_msg[i] && (p - json_output) < max_json_len - 200)
-        *p++ = base64_msg[i++];
-    
-    // ","Base64MessageHash":"
-    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's';
-    *p++ = 'e'; *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's';
-    *p++ = 's'; *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = 'H'; *p++ = 'a';
-    *p++ = 's'; *p++ = 'h'; *p++ = '"'; *p++ = ':'; *p++ = '"';
-    
-    // <base64_hash>
-    i = 0;
-    while (base64_hash[i])
-        *p++ = base64_hash[i++];
-    
-    // ","RspReceivedOK":false}
-    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'R'; *p++ = 's'; *p++ = 'p';
-    *p++ = 'R'; *p++ = 'e'; *p++ = 'c'; *p++ = 'e'; *p++ = 'i'; *p++ = 'v';
-    *p++ = 'e'; *p++ = 'd'; *p++ = 'O'; *p++ = 'K'; *p++ = '"'; *p++ = ':';
-    *p++ = 'f'; *p++ = 'a'; *p++ = 'l'; *p++ = 's'; *p++ = 'e'; *p++ = '}';
-    
-    *p = '\0';
-    
-    /* Copy base64 values to output buffers if provided */
-    if (out_base64_msg)
-    {
-        for (i = 0; i < 511 && base64_msg[i]; i++)
-            out_base64_msg[i] = base64_msg[i];
-        out_base64_msg[i] = '\0';
-    }
-    
-    if (out_base64_hash)
-    {
-        for (i = 0; i < 63 && base64_hash[i]; i++)
-            out_base64_hash[i] = base64_hash[i];
-        out_base64_hash[i] = '\0';
-    }
-    
-    return msgId;
-}
-
-// Build formatted test message: "Hello World !!! <i>\r\n" repeated testMsgLength times
-void build_formatted_msg(int i, int testMsgLength, char *output, int max_len)
-{
-    static const char template[] = "Hello World !!! ";
-    int repeat;
-    char *p;
-    int num_idx;
-    char num_str[12];
-    int n_idx;
-    int temp;
-    
-    p = output;
-    
-    for (repeat = 0; repeat < testMsgLength && (p - output) < max_len - 30; repeat++)
-    {
-        // Copy "Hello World !!! "
-        const char *t = template;
-        while (*t)
-            *p++ = *t++;
-        
-        // Add number
-        n_idx = 0;
-        temp = i;
-        if (temp == 0)
-        {
-            num_str[n_idx++] = '0';
-        }
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                num_str[n_idx++] = digits[--d_idx];
-        }
-        num_str[n_idx] = '\0';
-        
-        // Copy number
-        num_idx = 0;
-        while (num_str[num_idx])
-            *p++ = num_str[num_idx++];
-        
-        // Add \r\n
-        *p++ = '\r';
-        *p++ = '\n';
-    }
-    
-    *p = '\0';
-}
-
-// Print a response message
-// Check if a message ID was sent and verify it matches
-bool validate_received_msg_id(MessageTracker *t, int received_id, int *sent_index)
-{
-    int i;
-    for (i = 0; i < t->count; i++)
-    {
-        if (t->messages[i].id == received_id && t->messages[i].sent)
-        {
-            if (sent_index)
-                *sent_index = i;
-            return true;
-        }
-    }
-    return false;  // Received ID not in sent list
-}
-
-void print_response(ResponseMessage *response)
-{
-    int i;
-    int sent_idx;
-    bool id_valid;
-    bool category_match;
-    bool message_match;
-    bool hash_match;
-    
-    sent_idx = -1;
-    category_match = false;
-    message_match = false;
-    hash_match = false;
-    
-    id_valid = validate_received_msg_id(&g_sent_tracker, response->id, &sent_idx);
-    
-    print("\r\n>>> RESPONSE ARRIVED <<<\r\n");
-    print("Received Message ID: ");
-    {
-        char id_str[12];
-        int id_idx = 0;
-        int temp = response->id;
-        
-        if (temp == 0)
-            id_str[id_idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                id_str[id_idx++] = digits[--d_idx];
-        }
-        id_str[id_idx] = '\0';
-        print(id_str);
-    }
-    
-    /* Compare fields against last sent message */
-    if (id_valid && response->id == g_last_sent_msg.id)
-    {
-        /* Compare Category */
-        category_match = true;
-        for (i = 0; response->category[i] || g_last_sent_msg.category[i]; i++)
-        {
-            if (response->category[i] != g_last_sent_msg.category[i])
-            {
-                category_match = false;
-                break;
-            }
-        }
-        
-        /* Compare Base64 Message */
-        message_match = true;
-        for (i = 0; response->base64_message[i] || g_last_sent_msg.base64_message[i]; i++)
-        {
-            if (response->base64_message[i] != g_last_sent_msg.base64_message[i])
-            {
-                message_match = false;
-                break;
-            }
-        }
-        
-        /* Compare Base64 Hash */
-        hash_match = true;
-        for (i = 0; response->base64_hash[i] || g_last_sent_msg.base64_hash[i]; i++)
-        {
-            if (response->base64_hash[i] != g_last_sent_msg.base64_hash[i])
-            {
-                hash_match = false;
-                break;
-            }
-        }
-    }
-    
-    print("\r\n--- Field Comparison Summary ---\r\n");
-    print("ID:       ");
-    if (id_valid)
-        print("OK\r\n");
-    else
-        print("FAILED\r\n");
-    
-    print("Category: ");
-    if (id_valid && category_match)
-        print("OK\r\n");
-    else if (!id_valid)
-        print("N/A (ID not found)\r\n");
-    else
-        print("FAILED\r\n");
-    
-    print("Message:  ");
-    if (id_valid && message_match)
-        print("OK\r\n");
-    else if (!id_valid)
-        print("N/A (ID not found)\r\n");
-    else
-        print("FAILED\r\n");
-    
-    print("Hash:     ");
-    if (id_valid && hash_match)
-        print("OK\r\n");
-    else if (!id_valid)
-        print("N/A (ID not found)\r\n");
-    else
-        print("FAILED\r\n");
-    
-    print("<<< END RESPONSE >>>\r\n");
-    
-    /* Mark response in tracker with comparison result */
-    if (id_valid)
-    {
-        bool overall_success = category_match && message_match && hash_match;
-        tracker_mark_response(&g_sent_tracker, response->id, overall_success);
-    }
-    
-    /* Display RAM usage */
-    print_ram_usage();
-}
-
-// Send a message in normal mode using AT+CIPSEND
-bool send_message(int fd, char *message)
-{
-    static char cmd[128];
-    int msg_len;
-    int total_len;  // msg_len + 2 for \r\n terminator
-    char *p;
-    int idx;
-    int temp;
-    
-    msg_len = 0;
-    p = message;
-    
-    // Calculate message length
-    while (*p)
-    {
-        msg_len++;
-        p++;
-    }
-    
-    // Total length includes \r\n terminator
-    total_len = msg_len + 2;
-    
-    // Build AT+CIPSEND=<length> command (single connection mode)
-    cmd[0] = 'A';
-    cmd[1] = 'T';
-    cmd[2] = '+';
-    cmd[3] = 'C';
-    cmd[4] = 'I';
-    cmd[5] = 'P';
-    cmd[6] = 'S';
-    cmd[7] = 'E';
-    cmd[8] = 'N';
-    cmd[9] = 'D';
-    cmd[10] = '=';
-    
-    // Convert length to string (use total_len which includes \r\n)
-    idx = 11;
-    temp = total_len;
-    if (temp == 0)
-    {
-        cmd[idx++] = '0';
-    }
-    else
-    {
-        char digits[16];
-        int d_idx = 0;
-        while (temp > 0)
-        {
-            digits[d_idx++] = '0' + (temp % 10);
-            temp /= 10;
-        }
-        while (d_idx > 0)
-            cmd[idx++] = digits[--d_idx];
-    }
-    cmd[idx] = '\0';
-    
-    print("\r\n--- Sending: ");
-    print(message);
-    print(" ---\r\n");
-    
-    // Send AT+CIPSEND=<length>
-    print("Sending: ");
-    print(cmd);
-    print("\r\n");
-    
-    send_to_modem(fd, cmd);
-    
-    // Wait for ">" prompt before sending data
-    print("Waiting for > prompt...\r\n");
-    {
-        static char prompt_buffer[64];
-        int prompt_idx = 0;
-        char ch;
-        int timeout = 0;
-        bool got_prompt = false;
-        
-        prompt_buffer[0] = '\0';
-        
-        // Wait up to 5 seconds for prompt
-        while (timeout < 5000 && !got_prompt)
-        {
-            ria_push_char(1);
-            ria_set_ax(fd);
-
-            if (ria_call_int(RIA_OP_READ_XSTACK))
-            {
-                ch = ria_pop_char();
-                
-                // Echo to console
-                if (RIA.ready & RIA_READY_TX_BIT)
-                    RIA.tx = ch;
-                
-                // Add to buffer
-                if (prompt_idx < 63)
-                {
-                    prompt_buffer[prompt_idx++] = ch;
-                    prompt_buffer[prompt_idx] = '\0';
-                }
-                
-                // Check for ">" character
-                if (ch == '>')
-                {
-                    got_prompt = true;
-                    print("\r\nGot > prompt!\r\n");
-                    break;
-                }
-                
-                // Keep buffer manageable
-                if (prompt_idx > 50)
-                {
-                    // Shift buffer left
-                    int i;
-                    for (i = 0; i < 32; i++)
-                        prompt_buffer[i] = prompt_buffer[prompt_idx - 32 + i];
-                    prompt_idx = 32;
-                    prompt_buffer[prompt_idx] = '\0';
-                }
-                
-                timeout = 0;  // Reset timeout when we receive data
-            }
-            else
-            {
-                delay_ms(10);
-                timeout += 10;
-            }
-        }
-        
-        if (!got_prompt)
-        {
-            print("ERROR: Timeout waiting for > prompt\r\n");
-            return false;
-        }
-    }
-    
-    // Delay to let modem settle after prompt
-    delay_ms(100);
-    
-    // Now send the actual message data with \r\n terminator
-    print("Sending message data...\r\n");
-    print("Length: ");
-    {
-        char len_str[12];
-        int len_idx = 0;
-        int temp = total_len;
-        
-        if (temp == 0)
-            len_str[len_idx++] = '0';
-        else
-        {
-            char digits[12];
-            int d_idx = 0;
-            while (temp > 0)
-            {
-                digits[d_idx++] = '0' + (temp % 10);
-                temp /= 10;
-            }
-            while (d_idx > 0)
-                len_str[len_idx++] = digits[--d_idx];
-        }
-        len_str[len_idx] = '\0';
-        print(len_str);
-    }
-    
-    print(" bytes\r\n");
-//    print("Data: ");
-    //print(message);    
-    //print("\r\n");
-    
-    // Send message bytes
-    send_raw_data(fd, message, msg_len);
-    
-    // Send \r\n terminator as part of the payload
-    ria_push_char('\r');
-    ria_set_ax(fd);
-    while (!ria_call_int(RIA_OP_WRITE_XSTACK))
-        ;
-    ria_push_char('\n');
-    ria_set_ax(fd);
-    while (!ria_call_int(RIA_OP_WRITE_XSTACK))
-        ;
-    
-    // Wait for modem to fully buffer and transmit before asking for SEND OK
-    // This prevents the modem from fragmenting the message
-    delay_ms(1000);
-    
-    // Wait for SEND OK response
-    print("Waiting for OK...\r\n");
-    {
-        static char send_buffer[128];
-        int send_idx = 0;
-        char ch;
-        int timeout = 0;
-        bool got_send_ok = false;
-        
-        send_buffer[0] = '\0';
-        
-        // Wait up to 5 seconds for SEND OK
-        while (timeout < 5000 && !got_send_ok)
-        {
-            ria_push_char(1);
-            ria_set_ax(fd);
-            if (ria_call_int(RIA_OP_READ_XSTACK))
-            {
-                ch = ria_pop_char();
-                
-                // Echo to console
-                if (RIA.ready & RIA_READY_TX_BIT)
-                    RIA.tx = ch;
-                
-                // Add to buffer
-                if (send_idx < 127)
-                {
-                    send_buffer[send_idx++] = ch;
-                    send_buffer[send_idx] = '\0';
-                }
-                
-                // Check for "SEND OK"
-                if (my_strstr(send_buffer, "OK"))
-                {
-                    got_send_ok = true;
-                    print("\r\nGot OK!\r\n");
-                    break;
-                }
-                
-                // Keep buffer manageable
-                if (send_idx > 100)
-                {
-                    // Shift buffer left
-                    int i;
-                    for (i = 0; i < 64; i++)
-                        send_buffer[i] = send_buffer[send_idx - 64 + i];
-                    send_idx = 64;
-                    send_buffer[send_idx] = '\0';
-                }
-                
-                timeout = 0;  // Reset timeout when we receive data
-            }
-            else
-            {
-                delay_ms(10);
-                timeout += 10;
-            }
-        }
-        
-        if (!got_send_ok)
-        {
-            print("WARNING: Timeout waiting for SEND OK\r\n");
-            // Continue anyway - message may have been sent
-        }
-    }
-    
-    //print("--- Message sent ---\r\n");
-    return true;
-}
-
-void main()
-{
-    char rx_char, tx_char;
-    int fd, cp;
-    static char test_message[512];
-    static char json_message[1024];
-    int loop_count;
-    int flush_count;
-    int heartbeat;
-    int test_msg_counter;
-    int msgId;
-
-    loop_count = 0;
-    test_msg_counter = 1;
-    
-    // Initialize response queue and message tracker
-    queue_init(&g_response_queue);
-    tracker_init(&g_sent_tracker);
-
-    cp = code_page(437);
-    if (cp != 437)
-    {
-        print("Code page 437 not found.\r\n");
-    }
-
-    fd = open("AT:", 0);
-    if (fd < 0)
-    {
-        print("Modem not found.\r\n");
-        return;
-    }
-    print("Modem online.\r\n");
-    
-    // Initialize WiFi connection
-    if (!init_wifi(fd))
+    if (!init_wifi(g_tcp_fd))
     {
         print("WiFi initialization failed.\r\n");
-        return;
-    }
+        return -1;
+    }    
 
-    print("Connected! Starting message loop...\r\n");
-    print("Ready to send/receive data. Loop running...\r\n");
-    delay_ms(500);
+//    for (k = 0; k < 10000; k++);
+    print("WiFi connected!\n");
     
-    // Start test timer
-    g_test_elapsed_ms = 0;
+    /* STEP 2: Connect to MQTT Broker */
+    print("[2/6] Connecting to MQTT broker...\n");
     
-    // Flush any pending data from connection setup
-    print("[Flushing initial data...]\r\n");
-    ria_push_char(1);
-    ria_set_ax(fd);
-    flush_count = 0;
-    while (ria_call_int(RIA_OP_READ_XSTACK) && flush_count++ < 1000)
-    {
-        rx_char = ria_pop_char();
-        if (RIA.ready & RIA_READY_TX_BIT)
-            RIA.tx = rx_char;
-        delay_ms(1);
-    }
-    print("[Flush complete]\r\n");
+    xram_strcpy(0x0000, broker);
+    xram_strcpy(0x0100, client_id);
     
-    // Main loop - send messages with interleaved response processing
-    {
-        int icounter = 1;
-        int batch_num = 1;
-        int batch_start;
-        int batch_end;
-        int i;
-        
-        print("Starting message transmission with interleaved response processing: ");
-        {
-            char count_str[12];
-            int c_idx = 0;
-            int temp = ITEST_MSG_COUNT;
-            
-            if (temp == 0)
-                count_str[c_idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    count_str[c_idx++] = digits[--d_idx];
-            }
-            count_str[c_idx] = '\0';
-            print(count_str);
-        }
-        print(" messages total\r\n");
-        
-        loop_count = 0;
-        heartbeat = 0;
-        
-        while (icounter <= ITEST_MSG_COUNT)
-        {
-            batch_start = icounter;
-            batch_end = (icounter + BATCH_SIZE > ITEST_MSG_COUNT) ? ITEST_MSG_COUNT + 1 : icounter + BATCH_SIZE;
-            
-            print("--- Batch ");
-            {
-                char batch_str[12];
-                int b_idx = 0;
-                int temp = batch_num;
-                
-                if (temp == 0)
-                    batch_str[b_idx++] = '0';
-                else
-                {
-                    char digits[12];
-                    int d_idx = 0;
-                    
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        batch_str[b_idx++] = digits[--d_idx];
-                }
-                batch_str[b_idx] = '\0';
-                print(batch_str);
-            }
-            print(" (messages ");
-            {
-                char start_str[12];
-                int s_idx = 0;
-                int temp = batch_start;
-                
-                if (temp == 0)
-                    start_str[s_idx++] = '0';
-                else
-                {
-                    char digits[12];
-                    int d_idx = 0;
-                    
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        start_str[s_idx++] = digits[--d_idx];
-                }
-                start_str[s_idx] = '\0';
-                print(start_str);
-            }
-            print("-");
-            {
-                char end_str[12];
-                int e_idx = 0;
-                int temp = batch_end - 1;
-                
-                if (temp == 0)
-                    end_str[e_idx++] = '0';
-                else
-                {
-                    char digits[12];
-                    int d_idx = 0;
-                    
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        end_str[e_idx++] = digits[--d_idx];
-                }
-                end_str[e_idx] = '\0';
-                print(end_str);
-            }
-            print(") ---\r\n");
-            
-            // Send batch of messages with interleaved response processing
-            for (i = batch_start; i < batch_end; i++)
-            {
-                print("Message ");
-                {
-                    char msg_num_str[12];
-                    int m_idx = 0;
-                    int temp = i;
-                    
-                    if (temp == 0)
-                        msg_num_str[m_idx++] = '0';
-                    else
-                    {
-                        char digits[12];
-                        int d_idx = 0;
-                        
-                        while (temp > 0)
-                        {
-                            digits[d_idx++] = '0' + (temp % 10);
-                            temp /= 10;
-                        }
-                        while (d_idx > 0)
-                            msg_num_str[m_idx++] = digits[--d_idx];
-                    }
-                    msg_num_str[m_idx] = '\0';
-                    print(msg_num_str);
-                }
-                print(": Building... ");
-                
-                // Build formatted message
-                build_formatted_msg(i, TEST_MSG_LENGTH, test_message, 512);
-                
-                // Build JSON message and get base64 values
-                {
-                    static char sent_base64_msg[512];
-                    static char sent_base64_hash[64];
-                    
-                    msgId = build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash);
-                    
-                    print("Sending... ");
-                    print(test_message);                
-                    
-                    // Send message
-                    if (send_message(fd, json_message))
-                    {
-                        print("OK\r\n");
-                        // Track this message as sent with content
-                        tracker_mark_sent(&g_sent_tracker, msgId, "Test", sent_base64_msg, sent_base64_hash);
-                    }
-                    else
-                    {
-                        print("FAILED\r\n");
-                    }
-                }
-                
-                // After each message, process any responses that have arrived (poll several times)
-                {
-                    static char dummy_buf[256];
-                    int poll;
-                    int idle_empty;
-                    idle_empty = 0;
-                    for (poll = 0; poll < 50; poll++)
-                    {
-                        int chars_processed = uart_reader_loop(fd, dummy_buf, 256);
-                        
-                        if (chars_processed > 0)
-                        {
-                            idle_empty = 0;
-                        }
-                        else
-                        {
-                            idle_empty++;
-                            if (idle_empty > 20)  // Increased from 5 to wait longer for slow data
-                                break;
-                            delay_ms(5);
-                        }
-                        
-                        // Process any queued responses
-                        {
-                            ResponseMessage response;
-                            while (queue_get(&g_response_queue, &response))
-                            {
-                                // Validate that the received message ID was actually sent
-                                if (validate_received_msg_id(&g_sent_tracker, response.id, NULL))
-                                {
-                                    // Mark this message ID as having received a response
-                                    /* Response marking now done in print_response */
-                                    
-                                    // Print the response
-                                    print_response(&response);
-                                }
-                                else
-                                {
-                                    // ID mismatch - print error
-                                    print("\r\n!!! ERROR: Received response for ID ");
-                                    {
-                                        char id_str[12];
-                                        int id_idx = 0;
-                                        int temp = response.id;
-                                        if (temp == 0)
-                                            id_str[id_idx++] = '0';
-                                        else
-                                        {
-                                            char digits[12];
-                                            int d_idx = 0;
-                                            while (temp > 0)
-                                            {
-                                                digits[d_idx++] = '0' + (temp % 10);
-                                                temp /= 10;
-                                            }
-                                            while (d_idx > 0)
-                                                id_str[id_idx++] = digits[--d_idx];
-                                        }
-                                        id_str[id_idx] = '\0';
-                                        print(id_str);
-                                    }
-                                    print(" but no matching sent message! !!!");
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // No delay - move to next message immediately
-            }
-            
-            print("Batch ");
-            {
-                char batch_end_str[12];
-                int be_idx = 0;
-                int temp = batch_num;
-                
-                if (temp == 0)
-                    batch_end_str[be_idx++] = '0';
-                else
-                {
-                    char digits[12];
-                    int d_idx = 0;
-                    
-                    while (temp > 0)
-                    {
-                        digits[d_idx++] = '0' + (temp % 10);
-                        temp /= 10;
-                    }
-                    while (d_idx > 0)
-                        batch_end_str[be_idx++] = digits[--d_idx];
-                }
-                batch_end_str[be_idx] = '\0';
-                print(batch_end_str);
-            }
-            print(" complete\r\n");
-            
-            icounter = batch_end;
-            
-            // Move to next batch
-            if (icounter <= ITEST_MSG_COUNT)
-            {
-                batch_num++;
-            }
-        }
-        
-        print("All ");
-        {
-            char final_str[12];
-            int f_idx = 0;
-            int temp = ITEST_MSG_COUNT;
-            
-            if (temp == 0)
-                final_str[f_idx++] = '0';
-            else
-            {
-                char digits[12];
-                int d_idx = 0;
-                
-                while (temp > 0)
-                {
-                    digits[d_idx++] = '0' + (temp % 10);
-                    temp /= 10;
-                }
-                while (d_idx > 0)
-                    final_str[f_idx++] = digits[--d_idx];
-            }
-            final_str[f_idx] = '\0';
-            print(final_str);
-        }
-        print(" messages sent. Processing remaining responses...\r\n");
+    printf("Broker: %s:%d\n", broker, port);
+    printf("Client: %s\n", client_id);
+    
+    // Initiate connection
+    RIA.xstack = port & 0xFF;
+    RIA.xstack = port >> 8;
+    RIA.xstack = 0x00;    RIA.xstack = 0x00;  // hostname addr
+    RIA.a = 0x00;
+    RIA.x = 0x01;             // client_id addr
+    RIA.op = 0x30;  // mq_connect
+    
+    if (RIA.a != 0) {
+        printf("ERROR: Connection failed: %d\n", RIA.a);
+        return 1;
     }
     
-    // After sending all messages, continue processing any remaining responses
-    print("Entering continuous response processing mode...\r\n");
-    loop_count = 0;
-    heartbeat = 0;
-    
-    while (true)
-    {
-        // Heartbeat indicator every 50 seconds worth of loops
-        if (++heartbeat > 50)
-        {
-            heartbeat = 0;
-            print(".");
+    /* Wait for connection */
+    print("Waiting for MQTT connection...");
+
+    for (i = 0; i < 50; i++) {
+        for (k = 0; k < 10000; k++);
+        RIA.op = 0x38;  /* mq_connected */
+        if (RIA.a == 1) {
+            print(" CONNECTED!\n\n");
+            break;
         }
-        
-        // Use uart_reader_loop to process incoming data and parse responses
-        {
-            static char dummy_buf[256];
-            uart_reader_loop(fd, dummy_buf, 256);
-            
-            // Process any queued responses
-            {
-                ResponseMessage response;
-                while (queue_get(&g_response_queue, &response))
-                {
-                    // Validate that the received message ID was actually sent
-                    if (validate_received_msg_id(&g_sent_tracker, response.id, NULL))
-                    {
-                        // Mark this message ID as having received a response
-                        /* Response marking now done in print_response */
-                        
-                        // Print the response
-                        print_response(&response);
-                    }
-                    else
-                    {
-                        // ID mismatch - print error
-                        print("\r\n!!! ERROR: Received response for ID ");
-                        {
-                            char id_str[12];
-                            int id_idx = 0;
-                            int temp = response.id;
-                            if (temp == 0)
-                                id_str[id_idx++] = '0';
-                            else
-                            {
-                                char digits[12];
-                                int d_idx = 0;
-                                while (temp > 0)
-                                {
-                                    digits[d_idx++] = '0' + (temp % 10);
-                                    temp /= 10;
-                                }
-                                while (d_idx > 0)
-                                    id_str[id_idx++] = digits[--d_idx];
-                            }
-                            id_str[id_idx] = '\0';
-                            print(id_str);
-                        }
-                        print(" but no matching sent message! !!!");
-                    }
-                }
-            }
-        }
-        
-        // Check for console input
-        if (RIA.ready & RIA_READY_RX_BIT)
-        {
-            tx_char = RIA.rx;
-            // Echo to console
-            if (RIA.ready & RIA_READY_TX_BIT)
-                RIA.tx = tx_char;
-            
-            // Check for 's' key to show tracking status
-            if (tx_char == 's' || tx_char == 'S')
-            {
-                tracker_print_status(&g_sent_tracker);
-            }
-            
-            // Send console input to modem
-            ria_push_char(tx_char);
-            ria_set_ax(fd);
-            ria_call_int(RIA_OP_WRITE_XSTACK);
-        }
-        
-        // Periodically check if all messages have been received
-        if (loop_count++ > 500)
-        {
-            int missing = tracker_get_missing_count(&g_sent_tracker);
-            if (missing == 0 && g_sent_tracker.count > 0)
-            {
-                if (!g_test_complete)
-                {
-                    g_test_final_duration_ms = (unsigned int)g_test_elapsed_ms;
-                    g_test_complete = true;
-                }
-                if (!g_status_printed)
-                {
-                    print("\r\n*** ALL MESSAGES RECEIVED! ***\r\n");
-                    tracker_print_status(&g_sent_tracker);
-                    g_status_printed = true;
-                }
-                loop_count = 0;  // Reset to avoid repeated printing
-            }
-            loop_count = 0;
-        }
-        
-        // Small delay to allow data to accumulate and prevent CPU overload
-        delay_ms(10);
+        if (i % 5 == 0) print(".");
     }
+    
+    RIA.op = 0x38;  /* Check connection status */
+
+    if (RIA.a != 1) {
+        print("\nERROR: Connection timeout\n");
+        return 1;
+    }
+    
+    /* STEP 3: Subscribe to Topics */
+    print("[3/6] Subscribing to topics...\n");
+    
+    xram_strcpy(0x0200, sub_topic);
+    sub_len = strlen(sub_topic);
+    
+    printf("Subscribing to: %s\n", sub_topic);
+    
+    RIA.xstack = 0;                 // QoS 0
+    RIA.xstack = sub_len & 0xFF;
+    RIA.xstack = sub_len >> 8;
+    RIA.a = 0x00; RIA.x = 0x02;
+    RIA.op = 0x33;  // mq_subscribe
+    
+    if (RIA.a == 0) {
+        print("Subscribed successfully!\n\n");
+    } else {
+        print("ERROR: Subscribe failed\n");
+        return 1;
+    }
+    
+    /* STEP 4: Publish Messages */
+    print("[4/6] Publishing messages...\n");
+    
+    /* Publish message 1 */
+    xram_strcpy(0x0300, topic1);
+    xram_strcpy(0x0400, payload1);
+    
+    printf("Publishing: %s -> %s\n", topic1, payload1);
+    
+    RIA.xstack = 0;                              /* QoS 0 */
+    RIA.xstack = 0;                              /* retain = false */
+    RIA.xstack = strlen(topic1) & 0xFF;
+    RIA.xstack = strlen(topic1) >> 8;
+    RIA.xstack = 0x00; RIA.xstack = 0x03;        /* topic addr */
+    RIA.xstack = strlen(payload1) & 0xFF;
+    RIA.xstack = strlen(payload1) >> 8;
+    RIA.a = 0x00; RIA.x = 0x04;                  /* payload addr */
+    RIA.op = 0x32;  /* mq_publish */
+    
+    if (RIA.a != 0) {
+        print("ERROR: Publish 1 failed\n");
+    } else {
+        print("Message 1 published!\n");
+    }
+    
+    /* Small delay */
+    for (k = 0; k < 50000L; k++);
+    
+    /* Publish message 2 */
+    xram_strcpy(0x0300, topic2);
+    xram_strcpy(0x0400, payload2);
+    
+    printf("Publishing: %s -> %s\n", topic2, payload2);
+    
+    RIA.xstack = 0; RIA.xstack = 0;
+    RIA.xstack = strlen(topic2) & 0xFF;
+    RIA.xstack = strlen(topic2) >> 8;
+    RIA.xstack = 0x00; RIA.xstack = 0x03;
+    RIA.xstack = strlen(payload2) & 0xFF;
+    RIA.xstack = strlen(payload2) >> 8;
+    RIA.a = 0x00; RIA.x = 0x04;
+    RIA.op = 0x32;  // mq_publish
+    
+    if (RIA.a == 0) {
+        print("Message 2 published!\n");
+    }
+    
+    /* Publish status with retain flag */
+    xram_strcpy(0x0300, status_topic);
+    xram_strcpy(0x0400, status_payload);
+    
+    //print("Publishing: %s -> %s (retained)\n", status_topic, status_payload);
+    
+    RIA.xstack = 0;                              /* QoS 0 */
+    RIA.xstack = 1;                              /* retain = TRUE */
+    RIA.xstack = strlen(status_topic) & 0xFF;
+    RIA.xstack = strlen(status_topic) >> 8;
+    RIA.xstack = 0x00; RIA.xstack = 0x03;
+    RIA.xstack = strlen(status_payload) & 0xFF;
+    RIA.xstack = strlen(status_payload) >> 8;
+    RIA.a = 0x00; RIA.x = 0x04;
+    RIA.op = 0x32;  /* mq_publish */
+    
+    if (RIA.a == 0) {
+        print("Status published and retained!\n\n");
+    }
+    
+    /* STEP 5: Listen for Messages */
+    print("[5/6] Listening for incoming messages (20 seconds)...\n");
+    print("Note: We'll receive our own published messages\n\n");
+    
+    for (i = 0; i < 200; i++) {  /* 20 seconds */
+        /* Poll for messages */
+        RIA.op = 0x35;  /* mq_poll */
+        msg_len = RIA.a | (RIA.x << 8);
+        
+        if (msg_len > 0) {
+            msg_count++;
+            printf("\n=== Message %d (Payload: %d bytes) ===\n", msg_count, msg_len);
+            
+            /* Get topic */
+            RIA.xstack = 128 & 0xFF;
+            RIA.xstack = 128 >> 8;
+            RIA.a = 0x00; RIA.x = 0x05;
+            RIA.op = 0x37;  /* mq_get_topic */
+            
+            topic_len = RIA.a | (RIA.x << 8);
+            
+            printf("Topic: ");
+            RIA.addr0 = 0x0500;
+            for (j = 0; j < topic_len; j++) {
+                putchar(RIA.rw0);
+            }
+            printf("\n");
+            
+            /* Read message */
+            RIA.xstack = 255 & 0xFF;
+            RIA.xstack = 255 >> 8;
+            RIA.a = 0x00; RIA.x = 0x06;
+            RIA.op = 0x36;  /* mq_read_message */
+            
+            bytes_read = RIA.a | (RIA.x << 8);
+            
+            printf("Payload: ");
+            RIA.addr0 = 0x0600;
+            for (j = 0; j < bytes_read; j++) {
+                putchar(RIA.rw0);
+            }
+            printf("\n");
+        }
+        
+        /* Progress indicator */
+        if (i % 20 == 0 && i > 0) {
+            printf(".");
+            fflush(stdout);
+        }
+        
+        /* Delay ~100ms */
+        for (k = 0; k < 10000; k++);
+    }
+    
+    printf("\n\nReceived %d message%s total\n\n", 
+           msg_count, msg_count == 1 ? "" : "s");
+    
+    /* STEP 6: Disconnect */
+    printf("[6/6] Disconnecting from broker...\n");
+    RIA.op = 0x31;  /* mq_disconnect */
+    
+    if (RIA.a == 0) {
+        printf("Disconnected successfully!\n");
+    }
+    
+    printf("\n=== EXAMPLE COMPLETE ===\n");
+    printf("Summary:\n");
+    printf("  - Connected to %s\n", broker);
+    printf("  - Subscribed to: %s\n", sub_topic);
+    printf("  - Published 3 messages\n");
+    printf("  - Received %d messages\n", msg_count);
+    printf("  - Disconnected cleanly\n");
+    
+    return 0;
 }
