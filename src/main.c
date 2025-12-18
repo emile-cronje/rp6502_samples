@@ -9,6 +9,7 @@
 #define WIFI_SSID "Cudy24G"
 #define WIFI_PASSWORD "ZAnne19991214"
 #define SERVER_IP "192.168.10.174"
+//#define SERVER_IP "test.mosquitto.org"
 #define SERVER_PORT "1883"
 
 static int g_tcp_fd = -1;
@@ -88,12 +89,32 @@ void print(char *s)
 }
 
 /* Helper function to copy string to XRAM */
-void xram_strcpy(unsigned int addr, const char* str) {
+void xram_strcpy_old(unsigned int addr, const char* str) {
     int i;
     RIA.addr0 = addr;
     for (i = 0; str[i]; i++) {
         RIA.rw0 = str[i];
     }
+    RIA.rw0 = 0;
+}
+
+void xram_strcpy(unsigned int addr, const char* str) {
+    int i;
+    RIA.step0 = 1;  // Enable auto-increment
+    RIA.addr0 = addr;
+    for (i = 0; str[i]; i++) {
+        RIA.rw0 = str[i];
+    }
+    RIA.rw0 = 0;
+}
+
+void xram_strcpy_old1(unsigned int addr, const char* str) {
+    int i;
+    for (i = 0; str[i]; i++) {
+        RIA.addr0 = addr + i;
+        RIA.rw0 = str[i];
+    }
+    RIA.addr0 = addr + i;
     RIA.rw0 = 0;
 }
 
@@ -332,24 +353,39 @@ int main() {
         return -1;
     }    
 
-//    for (k = 0; k < 10000; k++);
     print("WiFi connected!\n");
     
     /* STEP 2: Connect to MQTT Broker */
     print("[2/6] Connecting to MQTT broker...\n");
     
+    // print("Wrote string, checking: ");
+    // RIA.step0 = 1;
+    // RIA.addr0 = 0x0000;
+    // for (i = 0; i < 20; i++) {
+    //     char c = RIA.rw0;
+    //     if (c == 0) break;
+    //     putchar(c);
+    // }
+    // print("\n");    
+
     xram_strcpy(0x0000, broker);
     xram_strcpy(0x0100, client_id);
-    
+
     printf("Broker: %s:%d\n", broker, port);
     printf("Client: %s\n", client_id);
     
     // Initiate connection
-    RIA.xstack = port & 0xFF;
-    RIA.xstack = port >> 8;
-    RIA.xstack = 0x00;    RIA.xstack = 0x00;  // hostname addr
-    RIA.a = 0x00;
-    RIA.x = 0x01;             // client_id addr
+    RIA.xstack = port >> 8;      // port high
+    RIA.xstack = port & 0xFF;    // port low
+
+    // Push client_id last (will be popped first with api_pop_uint16)
+    RIA.xstack = 0x0100 >> 8;    // client_id high
+    RIA.xstack = 0x0100 & 0xFF;  // client_id low
+
+    // Put hostname address in A/X
+    RIA.a = 0x0000 & 0xFF;       // low
+    RIA.x = 0x0000 >> 8;    
+
     RIA.op = 0x30;  // mq_connect
     
     if (RIA.a != 0) {
