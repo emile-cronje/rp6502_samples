@@ -9,8 +9,8 @@
 #define WIFI_SSID "Cudy24G"
 #define WIFI_PASSWORD "ZAnne19991214"
 #define SERVER_IP "192.168.10.174"
-//#define SERVER_IP "test.mosquitto.org"
 #define SERVER_PORT "1883"
+#define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 
 static int g_tcp_fd = -1;
 
@@ -322,22 +322,250 @@ bool init_wifi(int fd)
     return true;
 }
 
+static int g_msgId = 1;
+
+// Base64 encoding table
+static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Simple Base64 encoder
+void base64_encode(const char *input, int input_len, char *output)
+{
+    int i;
+    unsigned char a, b, c;
+    int out_idx = 0;
+    
+    for (i = 0; i < input_len; i += 3)
+    {
+        a = input[i];
+        b = (i + 1 < input_len) ? input[i + 1] : 0;
+        c = (i + 2 < input_len) ? input[i + 2] : 0;
+        
+        output[out_idx++] = base64_table[a >> 2];
+        output[out_idx++] = base64_table[((a & 0x03) << 4) | (b >> 4)];
+        output[out_idx++] = (i + 1 < input_len) ? base64_table[((b & 0x0F) << 2) | (c >> 6)] : '=';
+        output[out_idx++] = (i + 2 < input_len) ? base64_table[c & 0x3F] : '=';
+    }
+    
+    output[out_idx] = '\0';
+}
+
+// Simple SHA256 implementation (simplified for embedded use)
+// Note: This is a basic implementation. For production, use a proper crypto library.
+void sha256_simple(const char *input, int input_len, unsigned char *hash)
+{
+    // For simplicity, we'll use a basic checksum instead of full SHA256
+    // A full SHA256 implementation would be quite large for cc65
+    int i;
+    unsigned long sum = 0x5A5A5A5AL;  // seed
+    
+    for (i = 0; i < input_len; i++)
+    {
+        sum = ((sum << 5) + sum) + (unsigned char)input[i];
+        sum ^= (sum >> 16);
+    }
+    
+    // Generate 32 bytes of "hash" from the checksum
+    for (i = 0; i < 32; i++)
+    {
+        hash[i] = (unsigned char)((sum >> ((i % 4) * 8)) & 0xFF);
+        if (i % 4 == 3)
+            sum = ((sum << 7) ^ (sum >> 11)) + input[i % input_len];
+    }
+}
+
+int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *out_base64_msg, char *out_base64_hash)
+{
+    static char base64_msg[512];
+    static char base64_hash[64];
+    static unsigned char hash[32];
+    int msg_len;
+    int msgId;
+    char *p;
+    int i;
+    char id_str[12];
+    int id_idx;
+    
+    // Get message length
+    msg_len = 0;
+    p = msg_text;
+    while (*p)
+    {
+        msg_len++;
+        p++;
+    }
+    
+    // Calculate hash
+    sha256_simple(msg_text, msg_len, hash);
+    
+    // Base64 encode message
+    base64_encode(msg_text, msg_len, base64_msg);
+    
+    // Base64 encode hash
+    base64_encode((char*)hash, 32, base64_hash);
+    
+    // Get next message ID
+    msgId = g_msgId++;
+    
+    // Convert msgId to string
+    id_idx = 0;
+    if (msgId == 0)
+    {
+        id_str[id_idx++] = '0';
+    }
+    else
+    {
+        char digits[12];
+        int d_idx = 0;
+        int temp = msgId;
+        
+        while (temp > 0)
+        {
+            digits[d_idx++] = '0' + (temp % 10);
+            temp /= 10;
+        }
+        while (d_idx > 0)
+            id_str[id_idx++] = digits[--d_idx];
+    }
+    id_str[id_idx] = '\0';
+    
+    // Build JSON string manually
+    p = json_output;
+    
+    // {"Id":
+    *p++ = '{'; *p++ = '"'; *p++ = 'I'; *p++ = 'd'; *p++ = '"'; *p++ = ':';
+    
+    // <msgId>
+    i = 0;
+    while (id_str[i])
+        *p++ = id_str[i++];
+    
+    // ,"Category":"Test"
+    *p++ = ','; *p++ = '"'; *p++ = 'C'; *p++ = 'a'; *p++ = 't'; *p++ = 'e';
+    *p++ = 'g'; *p++ = 'o'; *p++ = 'r'; *p++ = 'y'; *p++ = '"'; *p++ = ':';
+    *p++ = '"'; *p++ = 'T'; *p++ = 'e'; *p++ = 's'; *p++ = 't'; *p++ = '"';
+    
+    // ,"Base64Message":"
+    *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's'; *p++ = 'e';
+    *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
+    *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    // <base64_msg>
+    i = 0;
+    while (base64_msg[i] && (p - json_output) < max_json_len - 200)
+        *p++ = base64_msg[i++];
+    
+    // ","Base64MessageHash":"
+    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's';
+    *p++ = 'e'; *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's';
+    *p++ = 's'; *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = 'H'; *p++ = 'a';
+    *p++ = 's'; *p++ = 'h'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    // <base64_hash>
+    i = 0;
+    while (base64_hash[i])
+        *p++ = base64_hash[i++];
+    
+    // ","RspReceivedOK":false}
+    *p++ = '"'; *p++ = ','; *p++ = '"'; *p++ = 'R'; *p++ = 's'; *p++ = 'p';
+    *p++ = 'R'; *p++ = 'e'; *p++ = 'c'; *p++ = 'e'; *p++ = 'i'; *p++ = 'v';
+    *p++ = 'e'; *p++ = 'd'; *p++ = 'O'; *p++ = 'K'; *p++ = '"'; *p++ = ':';
+    *p++ = 'f'; *p++ = 'a'; *p++ = 'l'; *p++ = 's'; *p++ = 'e'; *p++ = '}';
+    
+    *p = '\0';
+    
+    /* Copy base64 values to output buffers if provided */
+    if (out_base64_msg)
+    {
+        for (i = 0; i < 511 && base64_msg[i]; i++)
+            out_base64_msg[i] = base64_msg[i];
+        out_base64_msg[i] = '\0';
+    }
+    
+    if (out_base64_hash)
+    {
+        for (i = 0; i < 63 && base64_hash[i]; i++)
+            out_base64_hash[i] = base64_hash[i];
+        out_base64_hash[i] = '\0';
+    }
+    
+    return msgId;
+}
+
+// Build formatted test message: "Hello World !!! <i>\r\n" repeated testMsgLength times
+void build_formatted_msg(int i, int testMsgLength, char *output, int max_len)
+{
+    static const char template[] = "Hello World !!! ";
+    int repeat;
+    char *p;
+    int num_idx;
+    char num_str[12];
+    int n_idx;
+    int temp;
+    
+    p = output;
+    
+    for (repeat = 0; repeat < testMsgLength && (p - output) < max_len - 30; repeat++)
+    {
+        // Copy "Hello World !!! "
+        const char *t = template;
+        while (*t)
+            *p++ = *t++;
+        
+        // Add number
+        n_idx = 0;
+        temp = i;
+        if (temp == 0)
+        {
+            num_str[n_idx++] = '0';
+        }
+        else
+        {
+            char digits[12];
+            int d_idx = 0;
+            
+            while (temp > 0)
+            {
+                digits[d_idx++] = '0' + (temp % 10);
+                temp /= 10;
+            }
+            while (d_idx > 0)
+                num_str[n_idx++] = digits[--d_idx];
+        }
+        num_str[n_idx] = '\0';
+        
+        // Copy number
+        num_idx = 0;
+        while (num_str[num_idx])
+            *p++ = num_str[num_idx++];
+        
+        // Add \r\n
+        *p++ = '\r';
+        *p++ = '\n';
+    }
+    
+    *p = '\0';
+}
+
 int main() {
     char broker[] = SERVER_IP;
     char client_id[] = "rp6502_demo";
     unsigned int port = 1883;
-    char sub_topic[] = "rp6502/demo/#";
+    char sub_topic[] = "rp6502_sub";
     unsigned int sub_len;
-    char topic1[] = "rp6502/demo/temperature";
-    char payload1[] = "22.5 C";
-    char topic2[] = "rp6502/demo/humidity";
+    char pub_topic1[] = "rp6502_pub";
+//    char payload1[] = "22.5 C";
+    char pub_topic2[] = "rp6502_pub";
     char payload2[] = "65%";
-    char status_topic[] = "rp6502/demo/status";
+    char status_topic[] = "rp6502_test/status";
     char status_payload[] = "online";
     int msg_count = 0;
     int i, j;
     volatile long k;
     unsigned int msg_len, topic_len, bytes_read;
+    static char test_message[512];    
+    static char json_message[1024];    
+    static char sent_base64_msg[512];
+    static char sent_base64_hash[64];
     
     print("=== Complete MQTT Example ===\n\n");
     
@@ -436,20 +664,24 @@ int main() {
     
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
-    
+
+    build_formatted_msg(1, TEST_MSG_LENGTH, test_message, 512);    
+  
+    build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash);
+
     /* Publish message 1 */
-    xram_strcpy(0x0300, topic1);
-    xram_strcpy(0x0400, payload1);
+    xram_strcpy(0x0300, pub_topic1);
+    xram_strcpy(0x0400, json_message);
     
-    printf("Publishing: %s -> %s\n", topic1, payload1);
+    printf("Publishing: %s -> %s\n", pub_topic1, json_message);
     
     RIA.xstack = 0;                              /* QoS 0 */
     RIA.xstack = 0;                              /* retain = false */
-    RIA.xstack = strlen(topic1) & 0xFF;
-    RIA.xstack = strlen(topic1) >> 8;
+    RIA.xstack = strlen(pub_topic1) & 0xFF;
+    RIA.xstack = strlen(pub_topic1) >> 8;
     RIA.xstack = 0x00; RIA.xstack = 0x03;        /* topic addr */
-    RIA.xstack = strlen(payload1) & 0xFF;
-    RIA.xstack = strlen(payload1) >> 8;
+    RIA.xstack = strlen(json_message) & 0xFF;
+    RIA.xstack = strlen(json_message) >> 8;
     RIA.a = 0x00; RIA.x = 0x04;                  /* payload addr */
     RIA.op = 0x32;  /* mq_publish */
     
@@ -463,14 +695,14 @@ int main() {
     for (k = 0; k < 50000L; k++);
     
     /* Publish message 2 */
-    xram_strcpy(0x0300, topic2);
+    xram_strcpy(0x0300, pub_topic2);
     xram_strcpy(0x0400, payload2);
     
-    printf("Publishing: %s -> %s\n", topic2, payload2);
+    printf("Publishing: %s -> %s\n", pub_topic2, payload2);
     
     RIA.xstack = 0; RIA.xstack = 0;
-    RIA.xstack = strlen(topic2) & 0xFF;
-    RIA.xstack = strlen(topic2) >> 8;
+    RIA.xstack = strlen(pub_topic2) & 0xFF;
+    RIA.xstack = strlen(pub_topic2) >> 8;
     RIA.xstack = 0x00; RIA.xstack = 0x03;
     RIA.xstack = strlen(payload2) & 0xFF;
     RIA.xstack = strlen(payload2) >> 8;
@@ -501,6 +733,8 @@ int main() {
         print("Status published and retained!\n\n");
     }
     
+    return 0;
+
     /* STEP 5: Listen for Messages */
     print("[5/6] Listening for incoming messages (20 seconds)...\n");
     print("Note: We'll receive our own published messages\n\n");
