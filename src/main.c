@@ -444,6 +444,18 @@ int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *ou
     *p++ = 'g'; *p++ = 'o'; *p++ = 'r'; *p++ = 'y'; *p++ = '"'; *p++ = ':';
     *p++ = '"'; *p++ = 'T'; *p++ = 'e'; *p++ = 's'; *p++ = 't'; *p++ = '"';
     
+    // ,"Message":"
+    *p++ = ','; *p++ = '"'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
+    *p++ = 'a'; *p++ = 'g'; *p++ = 'e'; *p++ = '"'; *p++ = ':'; *p++ = '"';
+    
+    // <msg_text>
+    i = 0;
+    while (msg_text[i] && (p - json_output) < max_json_len - 300)
+        *p++ = msg_text[i++];
+    
+    // "
+    *p++ = '"';
+    
     // ,"Base64Message":"
     *p++ = ','; *p++ = '"'; *p++ = 'B'; *p++ = 'a'; *p++ = 's'; *p++ = 'e';
     *p++ = '6'; *p++ = '4'; *p++ = 'M'; *p++ = 'e'; *p++ = 's'; *p++ = 's';
@@ -674,15 +686,28 @@ int main() {
     xram_strcpy(0x0400, json_message);
     
     printf("Publishing: %s -> %s\n", pub_topic1, json_message);
+    printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
     
-    RIA.xstack = 0;                              /* QoS 0 */
-    RIA.xstack = 0;                              /* retain = false */
-    RIA.xstack = strlen(pub_topic1) & 0xFF;
-    RIA.xstack = strlen(pub_topic1) >> 8;
-    RIA.xstack = 0x00; RIA.xstack = 0x03;        /* topic addr */
+
+    // payload address    
+    RIA.xstack = 0x0400 >> 8;
+    RIA.xstack = 0x0400 & 0xFF;
+
+    // payload length    
+    RIA.xstack = strlen(json_message) >> 8;    
     RIA.xstack = strlen(json_message) & 0xFF;
-    RIA.xstack = strlen(json_message) >> 8;
-    RIA.a = 0x00; RIA.x = 0x04;                  /* payload addr */
+
+    // topic address    
+    RIA.xstack = 0x0300 >> 8;    // topic addr high
+    RIA.xstack = 0x0300 & 0xFF;  // topic addr low
+
+    // topic length
+    RIA.xstack = strlen(pub_topic1) >> 8;    
+    RIA.xstack = strlen(pub_topic1) & 0xFF;
+
+    RIA.xstack = 0;                              /* retain = false */    
+    RIA.xstack = 0;                              /* QoS 0 */    
+
     RIA.op = 0x32;  /* mq_publish */
     
     if (RIA.a != 0) {
