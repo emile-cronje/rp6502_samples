@@ -571,6 +571,7 @@ int main() {
     char status_topic[] = "rp6502_test/status";
     char status_payload[] = "online";
     int msg_count = 0;
+    int publish_total;
     int i, j;
     volatile long k;
     unsigned int msg_len, topic_len, bytes_read;
@@ -676,89 +677,56 @@ int main() {
     
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
+    publish_total = 1;  /* Number of test messages to send */
 
-    build_formatted_msg(1, TEST_MSG_LENGTH, test_message, 512);    
-  
-    build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash);
+    for (i = 0; i < publish_total; i++) {
+        build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
+        build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash);
 
-    /* Publish message 1 */
-    xram_strcpy(0x0300, pub_topic1);
-    xram_strcpy(0x0400, json_message);
-    
-    printf("Publishing: %s -> %s\n", pub_topic1, json_message);
-    printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
-    
+        xram_strcpy(0x0300, pub_topic1);
+        xram_strcpy(0x0400, json_message);
+        
+        printf("Publishing (%d/%d): %s -> %s\n", i + 1, publish_total, pub_topic1, json_message);
+        printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
+        
+        /* payload address */   
+        RIA.xstack = 0x0400 >> 8;
+        RIA.xstack = 0x0400 & 0xFF;
 
-    // payload address    
-    RIA.xstack = 0x0400 >> 8;
-    RIA.xstack = 0x0400 & 0xFF;
+        /* payload length */   
+        RIA.xstack = strlen(json_message) >> 8;    
+        RIA.xstack = strlen(json_message) & 0xFF;
 
-    // payload length    
-    RIA.xstack = strlen(json_message) >> 8;    
-    RIA.xstack = strlen(json_message) & 0xFF;
+        /* topic address */   
+        RIA.xstack = 0x0300 >> 8;    /* topic addr high */
+        RIA.xstack = 0x0300 & 0xFF;  /* topic addr low */
 
-    // topic address    
-    RIA.xstack = 0x0300 >> 8;    // topic addr high
-    RIA.xstack = 0x0300 & 0xFF;  // topic addr low
+        /* topic length */
+        RIA.xstack = strlen(pub_topic1) >> 8;    
+        RIA.xstack = strlen(pub_topic1) & 0xFF;
 
-    // topic length
-    RIA.xstack = strlen(pub_topic1) >> 8;    
-    RIA.xstack = strlen(pub_topic1) & 0xFF;
+        RIA.xstack = 0;                              /* retain = false */    
+        RIA.xstack = 0;                              /* QoS 0 */    
 
-    RIA.xstack = 0;                              /* retain = false */    
-    RIA.xstack = 0;                              /* QoS 0 */    
+        // Kick off publish
+        RIA.op = 0x32;  // mq_publish
 
-    RIA.op = 0x32;  /* mq_publish */
-    
-    if (RIA.a != 0) {
-        print("ERROR: Publish 1 failed\n");
-    } else {
-        print("Message 1 published!\n");
+        while (RIA.busy) { }
+
+        if (RIA.mq_publish_done)
+        {
+            print("Message published!\n");
+        }
+        else
+        {
+            print("ERROR: Publish failed\n");
+        }
+        
+        /* Small delay */
+        for (k = 0; k < 10000; k++);
     }
     
-    /* Small delay */
-    for (k = 0; k < 50000L; k++);
-    
-    /* Publish message 2 */
-    xram_strcpy(0x0300, pub_topic2);
-    xram_strcpy(0x0400, payload2);
-    
-    printf("Publishing: %s -> %s\n", pub_topic2, payload2);
-    
-    RIA.xstack = 0; RIA.xstack = 0;
-    RIA.xstack = strlen(pub_topic2) & 0xFF;
-    RIA.xstack = strlen(pub_topic2) >> 8;
-    RIA.xstack = 0x00; RIA.xstack = 0x03;
-    RIA.xstack = strlen(payload2) & 0xFF;
-    RIA.xstack = strlen(payload2) >> 8;
-    RIA.a = 0x00; RIA.x = 0x04;
-    RIA.op = 0x32;  // mq_publish
-    
-    if (RIA.a == 0) {
-        print("Message 2 published!\n");
-    }
-    
-    /* Publish status with retain flag */
-    xram_strcpy(0x0300, status_topic);
-    xram_strcpy(0x0400, status_payload);
-    
-    //print("Publishing: %s -> %s (retained)\n", status_topic, status_payload);
-    
-    RIA.xstack = 0;                              /* QoS 0 */
-    RIA.xstack = 1;                              /* retain = TRUE */
-    RIA.xstack = strlen(status_topic) & 0xFF;
-    RIA.xstack = strlen(status_topic) >> 8;
-    RIA.xstack = 0x00; RIA.xstack = 0x03;
-    RIA.xstack = strlen(status_payload) & 0xFF;
-    RIA.xstack = strlen(status_payload) >> 8;
-    RIA.a = 0x00; RIA.x = 0x04;
-    RIA.op = 0x32;  /* mq_publish */
-    
-    if (RIA.a == 0) {
-        print("Status published and retained!\n\n");
-    }
-    
-    return 0;
+    //return 0;
 
     /* STEP 5: Listen for Messages */
     print("[5/6] Listening for incoming messages (20 seconds)...\n");
