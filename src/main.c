@@ -506,7 +506,7 @@ int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *ou
 // Build formatted test message: "Hello World !!! <i>\r\n" repeated testMsgLength times
 void build_formatted_msg(int i, int testMsgLength, char *output, int max_len)
 {
-    static const char template[] = "Hello World !!! ";
+    static const char template[] = "Hello 6502 !!! ";
     int repeat;
     char *p;
     int num_idx;
@@ -551,8 +551,8 @@ void build_formatted_msg(int i, int testMsgLength, char *output, int max_len)
             *p++ = num_str[num_idx++];
         
         // Add \r\n
-        *p++ = '\r';
-        *p++ = '\n';
+//        *p++ = '\r';
+  //      *p++ = '\n';
     }
     
     *p = '\0';
@@ -677,7 +677,7 @@ int main() {
     
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
-    publish_total = 1;  /* Number of test messages to send */
+    publish_total = 1;
 
     for (i = 0; i < publish_total; i++) {
         build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
@@ -687,7 +687,7 @@ int main() {
         xram_strcpy(0x0400, json_message);
         
         printf("Publishing (%d/%d): %s -> %s\n", i + 1, publish_total, pub_topic1, json_message);
-        printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
+        //printf("Topic and message len: %zu -> %zu\n", strlen(pub_topic1), strlen(json_message));    
         
         /* payload address */   
         RIA.xstack = 0x0400 >> 8;
