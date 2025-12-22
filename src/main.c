@@ -3,9 +3,10 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 #define COMMAND_TIMEOUT 10000  // milliseconds
-#define RESPONSE_BUFFER_SIZE 256
+#define RESPONSE_BUFFER_SIZE 512
 #define WIFI_SSID "Cudy24G"
 #define WIFI_PASSWORD "ZAnne19991214"
 #define SERVER_IP "192.168.10.174"
@@ -13,6 +14,7 @@
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 #define MAX_TRACKED_MESSAGES 10 // Maximum messages to track
 
+volatile uint8_t mq_irq_flag = 0;
 static int g_tcp_fd = -1;
 
 /* Message tracking structure */
@@ -26,6 +28,35 @@ typedef struct {
 static TrackedMessage g_message_tracker[MAX_TRACKED_MESSAGES];
 static int g_tracked_count = 0;
 static unsigned long g_guid_counter = 0;
+
+void print(char *s)
+{
+    while (*s)
+        if (RIA.ready & RIA_READY_TX_BIT)
+            RIA.tx = *s++;
+}
+
+void __fastcall__ irq_handler(void) {
+    mq_irq_flag = 1;
+}
+
+void set_irq_handler(void (*handler)(void)) {
+    // Install IRQ vector for cc65/6502
+    // The IRQ vector is at $FFFE-$FFFF, but cc65 provides a wrapper
+    // For RP6502, we write the handler address to the IRQ vector
+    unsigned int addr = (unsigned int)handler;
+    
+    // Write low byte to $FFFE
+    *(unsigned char *)0xFFFE = (unsigned char)(addr & 0xFF);
+    // Write high byte to $FFFF
+    *(unsigned char *)0xFFFF = (unsigned char)(addr >> 8);
+}
+
+void setup_irq(void) {
+    __asm__("sei");
+    set_irq_handler(irq_handler);
+    __asm__("cli");
+}
 
 char* my_strstr(const char *haystack, const char *needle)
 {
@@ -94,23 +125,6 @@ void my_sprintf(char *dest, const char *fmt, const char *s1, const char *s2)
     *dest = '\0';
 }
 
-void print(char *s)
-{
-    while (*s)
-        if (RIA.ready & RIA_READY_TX_BIT)
-            RIA.tx = *s++;
-}
-
-/* Helper function to copy string to XRAM */
-void xram_strcpy_old(unsigned int addr, const char* str) {
-    int i;
-    RIA.addr0 = addr;
-    for (i = 0; str[i]; i++) {
-        RIA.rw0 = str[i];
-    }
-    RIA.rw0 = 0;
-}
-
 void xram_strcpy(unsigned int addr, const char* str) {
     int i;
     RIA.step0 = 1;  // Enable auto-increment
@@ -118,16 +132,6 @@ void xram_strcpy(unsigned int addr, const char* str) {
     for (i = 0; str[i]; i++) {
         RIA.rw0 = str[i];
     }
-    RIA.rw0 = 0;
-}
-
-void xram_strcpy_old1(unsigned int addr, const char* str) {
-    int i;
-    for (i = 0; str[i]; i++) {
-        RIA.addr0 = addr + i;
-        RIA.rw0 = str[i];
-    }
-    RIA.addr0 = addr + i;
     RIA.rw0 = 0;
 }
 
@@ -671,7 +675,7 @@ int main() {
     char broker[] = SERVER_IP;
     char client_id[] = "rp6502_demo";
     unsigned int port = 1883;
-    char sub_topic[] = "rp6502_sub1";
+    char sub_topic[] = "rp6502_sub";
     unsigned int sub_len;
     char pub_topic1[] = "rp6502_pub";
     int msg_count = 0;
@@ -771,10 +775,13 @@ int main() {
         print("ERROR: Subscribe failed\n");
         return 1;
     }
-    
+
+//    *(uint8_t *)0xFFF0 = 0x01;  // Enable IRQs    
+  //  setup_irq();
+
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
-    publish_total = 5;
+    publish_total = 10;
 
     for (i = 0; i < publish_total; i++) {
         unsigned int msg_guid_high, msg_guid_low;
@@ -808,7 +815,7 @@ int main() {
         RIA.xstack = strlen(pub_topic1) >> 8;    
         RIA.xstack = strlen(pub_topic1) & 0xFF;
 
-        RIA.xstack = 0;                              /* retain = false */    
+        RIA.xstack = 1;                              /* retain = false */    
         RIA.xstack = 1;                              /* QoS 1 */    
 
         // Kick off publish
@@ -826,7 +833,7 @@ int main() {
         }
         
         /* Small delay */
-        for (k = 0; k < 5000; k++);
+        for (k = 0; k < 10000; k++);
     }
     
     //return 0;
@@ -836,13 +843,22 @@ int main() {
     printf("Waiting for %d messages to be received\n", g_tracked_count);
     
     while (!all_messages_received()) {  /* 50 seconds max */
+        // if (mq_irq_flag == 0) {
+        //     delay_ms(1);
+        //     continue;
+        // }
+
+        mq_irq_flag = 0;
+        //print("IRQ: New message available!\n");
+
         RIA.op = 0x35;  /* mq_poll */
 
         while (RIA.busy) { }            
 
         msg_len = RIA.a | (RIA.x << 8);
-        
-        if (msg_len > 0) {
+
+        /* Drain all pending messages before delaying again */
+        while (msg_len > 0) {
             msg_count++;
             printf("\n=== Message %d (Payload: %d bytes) ===\n", msg_count, msg_len);
             
@@ -892,13 +908,13 @@ int main() {
                 unsigned int recv_guid_high = 0;
                 unsigned int recv_guid_low = 0;
                 int k;
-                static char payload_buf[256];
+                static char payload_buf[512];
                 
                 /* Copy payload to buffer for parsing */
                 RIA.addr0 = 0x0600;
                 RIA.step0 = 1;
 
-                for (j = 0; j < bytes_read && j < 255; j++) {
+                for (j = 0; j < bytes_read && j < 511; j++) {
                     payload_buf[j] = RIA.rw0;
                     putchar(payload_buf[j]);                    
                 }
@@ -1008,6 +1024,11 @@ int main() {
             // }
 
             // printf("\n");            
+
+            /* Poll again immediately to see if more messages are queued */
+            RIA.op = 0x35;  /* mq_poll */
+            while (RIA.busy) { }
+            msg_len = RIA.a | (RIA.x << 8);
         }
         
         /* Progress indicator */
@@ -1021,12 +1042,8 @@ int main() {
         {
             printf("\n\nAll messages received! Ending gracefully.\n");
         }
-        else
-        {
-            printf("\n\nStill waiting...\n");
-        }
 
-        for (k = 0; k < 10000; k++);
+        for (k = 0; k < 20000; k++);
     }
     
     printf("\n\nReceived %d message%s total\n", 
