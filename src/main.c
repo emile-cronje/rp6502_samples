@@ -661,12 +661,15 @@ int main() {
     sub_len = strlen(sub_topic);
     
     printf("Subscribing to: %s\n", sub_topic);
-    
-    RIA.xstack = 0;                 // QoS 0
+
+    RIA.xstack = 0x0200 >> 8;    
+    RIA.xstack = 0x0200 & 0xFF;    
+    RIA.xstack = sub_len >> 8;    
     RIA.xstack = sub_len & 0xFF;
-    RIA.xstack = sub_len >> 8;
-    RIA.a = 0x00; RIA.x = 0x02;
+    RIA.xstack = 0;                 // QoS 0    
     RIA.op = 0x33;  // mq_subscribe
+
+    while (RIA.busy) { }    
     
     if (RIA.a == 0) {
         print("Subscribed successfully!\n\n");
@@ -743,14 +746,16 @@ int main() {
             
             /* Get topic */
             RIA.xstack = 128 & 0xFF;
-            RIA.xstack = 128 >> 8;
-            RIA.a = 0x00; RIA.x = 0x05;
+            RIA.xstack = 128 >> 8;                        
+            RIA.a = 0x00;
+            RIA.x = 0x05;
             RIA.op = 0x37;  /* mq_get_topic */
             
             topic_len = RIA.a | (RIA.x << 8);
             
             printf("Topic: ");
             RIA.addr0 = 0x0500;
+
             for (j = 0; j < topic_len; j++) {
                 putchar(RIA.rw0);
             }
@@ -759,7 +764,8 @@ int main() {
             /* Read message */
             RIA.xstack = 255 & 0xFF;
             RIA.xstack = 255 >> 8;
-            RIA.a = 0x00; RIA.x = 0x06;
+            RIA.a = 0x00;
+            RIA.x = 0x06;
             RIA.op = 0x36;  /* mq_read_message */
             
             bytes_read = RIA.a | (RIA.x << 8);
