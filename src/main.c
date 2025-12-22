@@ -760,7 +760,7 @@ int main() {
     RIA.xstack = 0x0200 & 0xFF;    
     RIA.xstack = sub_len >> 8;    
     RIA.xstack = sub_len & 0xFF;
-    RIA.xstack = 0;                 // QoS 0    
+    RIA.xstack = 1;                 // QoS 1    
     RIA.op = 0x33;  // mq_subscribe
 
     while (RIA.busy) { }    
@@ -774,7 +774,7 @@ int main() {
     
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
-    publish_total = 10;
+    publish_total = 5;
 
     for (i = 0; i < publish_total; i++) {
         unsigned int msg_guid_high, msg_guid_low;
@@ -809,7 +809,7 @@ int main() {
         RIA.xstack = strlen(pub_topic1) & 0xFF;
 
         RIA.xstack = 0;                              /* retain = false */    
-        RIA.xstack = 0;                              /* QoS 0 */    
+        RIA.xstack = 1;                              /* QoS 1 */    
 
         // Kick off publish
         RIA.op = 0x32;  // mq_publish
@@ -826,7 +826,7 @@ int main() {
         }
         
         /* Small delay */
-        for (k = 0; k < 10000; k++);
+        for (k = 0; k < 5000; k++);
     }
     
     //return 0;
@@ -883,10 +883,6 @@ int main() {
             RIA.addr0 = 0x0600;
             RIA.step0 = 1;  // Enable auto-increment
 
-            // for (j = 0; j < bytes_read; j++) {
-            //     putchar(RIA.rw0);
-            // }
-
             printf("\n");
             
             /* Parse GUID from received message */
@@ -908,10 +904,39 @@ int main() {
                 }
                 
                 payload_buf[j] = '\0';
+
+                /* Dump first 80 bytes in hex for debugging */
+                // {
+                //     int dump_len;
+
+                //     dump_len = bytes_read;
+                //     if (dump_len > 80)
+                //         dump_len = 80;
+
+                //     printf("\nPayload hex (first %d bytes):\n", dump_len);
+                //     for (k = 0; k < dump_len; k++) {
+                //         printf("%02X ", (unsigned char)payload_buf[k]);
+                //         if (((k + 1) % 16) == 0)
+                //             printf("\n");
+                //     }
+                //     if ((dump_len % 16) != 0)
+                //         printf("\n");
+                // }
                 
-                /* Look for "Guid" key (allow optional whitespace after colon) */
-                guid_start = my_strstr(payload_buf, "\"Guid\"");
-                if (guid_start) {
+                /* Skip any leading control bytes (e.g., 0x00/0x0A) before JSON */
+                {
+                    int start_idx;
+
+                    start_idx = 0;
+
+                    while (start_idx < bytes_read && payload_buf[start_idx] != '{')
+                        start_idx++;
+
+                    guid_start = my_strstr(&payload_buf[start_idx], "\"Guid\"");
+                }
+
+                if (guid_start)
+                {
                     /* Move past "Guid" */
                     guid_start += 6; /* length of "Guid" */
 
@@ -968,6 +993,10 @@ int main() {
                         }
                     }
                 }
+                else
+                {
+                    printf("GUID not found in message payload\n");
+                }
             }
 
             // printf("Payload (%d bytes): ", bytes_read);
@@ -991,6 +1020,10 @@ int main() {
         if (all_messages_received())
         {
             printf("\n\nAll messages received! Ending gracefully.\n");
+        }
+        else
+        {
+            printf("\n\nStill waiting...\n");
         }
 
         for (k = 0; k < 10000; k++);
