@@ -562,14 +562,9 @@ int main() {
     char broker[] = SERVER_IP;
     char client_id[] = "rp6502_demo";
     unsigned int port = 1883;
-    char sub_topic[] = "rp6502_sub";
+    char sub_topic[] = "rp6502_sub1";
     unsigned int sub_len;
     char pub_topic1[] = "rp6502_pub";
-//    char payload1[] = "22.5 C";
-    char pub_topic2[] = "rp6502_pub";
-    char payload2[] = "65%";
-    char status_topic[] = "rp6502_test/status";
-    char status_payload[] = "online";
     int msg_count = 0;
     int publish_total;
     int i, j;
@@ -599,16 +594,6 @@ int main() {
     /* STEP 2: Connect to MQTT Broker */
     print("[2/6] Connecting to MQTT broker...\n");
     
-    // print("Wrote string, checking: ");
-    // RIA.step0 = 1;
-    // RIA.addr0 = 0x0000;
-    // for (i = 0; i < 20; i++) {
-    //     char c = RIA.rw0;
-    //     if (c == 0) break;
-    //     putchar(c);
-    // }
-    // print("\n");    
-
     xram_strcpy(0x0000, broker);
     xram_strcpy(0x0100, client_id);
 
@@ -670,7 +655,7 @@ int main() {
     RIA.op = 0x33;  // mq_subscribe
 
     while (RIA.busy) { }    
-    
+
     if (RIA.a == 0) {
         print("Subscribed successfully!\n\n");
     } else {
@@ -680,7 +665,7 @@ int main() {
     
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
-    publish_total = 1;
+    publish_total = 5;
 
     for (i = 0; i < publish_total; i++) {
         build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
@@ -733,24 +718,28 @@ int main() {
 
     /* STEP 5: Listen for Messages */
     print("[5/6] Listening for incoming messages (20 seconds)...\n");
-    print("Note: We'll receive our own published messages\n\n");
     
     for (i = 0; i < 200; i++) {  /* 20 seconds */
-        /* Poll for messages */
         RIA.op = 0x35;  /* mq_poll */
+
+        while (RIA.busy) { }            
+
         msg_len = RIA.a | (RIA.x << 8);
         
         if (msg_len > 0) {
             msg_count++;
             printf("\n=== Message %d (Payload: %d bytes) ===\n", msg_count, msg_len);
             
-            /* Get topic */
-            RIA.xstack = 128 & 0xFF;
-            RIA.xstack = 128 >> 8;                        
-            RIA.a = 0x00;
-            RIA.x = 0x05;
+            /* topic address */   
+            RIA.xstack = 0x0500 >> 8;    /* topic addr high */
+            RIA.xstack = 0x0500 & 0xFF;  /* topic addr low */
+            RIA.xstack = 128 >> 8;                                    
+            RIA.xstack = 128 & 0xFF; // buf len
+
             RIA.op = 0x37;  /* mq_get_topic */
             
+            while (RIA.busy) { }                
+
             topic_len = RIA.a | (RIA.x << 8);
             
             printf("Topic: ");
@@ -759,23 +748,40 @@ int main() {
             for (j = 0; j < topic_len; j++) {
                 putchar(RIA.rw0);
             }
+
             printf("\n");
             
             /* Read message */
-            RIA.xstack = 255 & 0xFF;
-            RIA.xstack = 255 >> 8;
-            RIA.a = 0x00;
-            RIA.x = 0x06;
+            RIA.xstack = 0x0600 >> 8;    /* topic addr high */
+            RIA.xstack = 0x0600 & 0xFF;  /* topic addr low */
+            RIA.xstack = 255 >> 8;            
+            RIA.xstack = 255 & 0xFF; // buf len
+
             RIA.op = 0x36;  /* mq_read_message */
             
+            while (RIA.busy) { }                
+
             bytes_read = RIA.a | (RIA.x << 8);
             
             printf("Payload: ");
             RIA.addr0 = 0x0600;
+            RIA.step0 = 1;  // Enable auto-increment
+
             for (j = 0; j < bytes_read; j++) {
                 putchar(RIA.rw0);
             }
+
             printf("\n");
+
+            // printf("Payload (%d bytes): ", bytes_read);
+            // RIA.addr0 = 0x0600;
+
+            // for (j = 0; j < bytes_read; j++) {
+            //     unsigned char c = RIA.rw0;
+            //     printf("%02X ", c);
+            // }
+
+            // printf("\n");            
         }
         
         /* Progress indicator */
