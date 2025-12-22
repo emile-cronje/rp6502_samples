@@ -11,8 +11,21 @@
 #define SERVER_IP "192.168.10.174"
 #define SERVER_PORT "1883"
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
+#define MAX_TRACKED_MESSAGES 10 // Maximum messages to track
 
 static int g_tcp_fd = -1;
+
+/* Message tracking structure */
+typedef struct {
+    unsigned int guid_high;  /* High 16 bits of GUID */
+    unsigned int guid_low;   /* Low 16 bits of GUID */
+    bool sent;
+    bool received;
+} TrackedMessage;
+
+static TrackedMessage g_message_tracker[MAX_TRACKED_MESSAGES];
+static int g_tracked_count = 0;
+static unsigned long g_guid_counter = 0;
 
 char* my_strstr(const char *haystack, const char *needle)
 {
@@ -121,6 +134,7 @@ void xram_strcpy_old1(unsigned int addr, const char* str) {
 void delay_ms(int ms)
 {
     int i, j;
+
     /* Time tracking is now done via loop counter */
     for (i = 0; i < ms; i++)
     {
@@ -324,6 +338,71 @@ bool init_wifi(int fd)
 
 static int g_msgId = 1;
 
+/* Generate simple GUID-like ID (32-bit) */
+void generate_guid(unsigned int *high, unsigned int *low)
+{
+    /* Simple incrementing GUID for embedded system */
+    g_guid_counter++;
+    *high = (unsigned int)((g_guid_counter >> 16) & 0xFFFF);
+    *low = (unsigned int)(g_guid_counter & 0xFFFF);
+}
+
+/* Add message to tracker */
+int track_message(unsigned int guid_high, unsigned int guid_low)
+{
+    if (g_tracked_count >= MAX_TRACKED_MESSAGES)
+        return -1;
+    
+    g_message_tracker[g_tracked_count].guid_high = guid_high;
+    g_message_tracker[g_tracked_count].guid_low = guid_low;
+    g_message_tracker[g_tracked_count].sent = true;
+    g_message_tracker[g_tracked_count].received = false;
+    g_tracked_count++;
+    
+    return g_tracked_count - 1;
+}
+
+/* Mark message as received */
+bool mark_received(unsigned int guid_high, unsigned int guid_low)
+{
+    int i;
+    for (i = 0; i < g_tracked_count; i++)
+    {
+        if (g_message_tracker[i].guid_high == guid_high &&
+            g_message_tracker[i].guid_low == guid_low)
+        {
+            g_message_tracker[i].received = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Check if all messages received */
+bool all_messages_received(void)
+{
+    int i;
+    for (i = 0; i < g_tracked_count; i++)
+    {
+        if (g_message_tracker[i].sent && !g_message_tracker[i].received)
+            return false;
+    }
+    return true;
+}
+
+/* Count received messages */
+int count_received_messages(void)
+{
+    int i;
+    int count = 0;
+    for (i = 0; i < g_tracked_count; i++)
+    {
+        if (g_message_tracker[i].received)
+            count++;
+    }
+    return count;
+}
+
 // Base64 encoding table
 static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -373,7 +452,7 @@ void sha256_simple(const char *input, int input_len, unsigned char *hash)
     }
 }
 
-int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *out_base64_msg, char *out_base64_hash)
+int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *out_base64_msg, char *out_base64_hash, unsigned int *guid_high, unsigned int *guid_low)
 {
     static char base64_msg[512];
     static char base64_hash[64];
@@ -405,6 +484,9 @@ int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *ou
     
     // Get next message ID
     msgId = g_msgId++;
+    
+    // Generate GUID
+    generate_guid(guid_high, guid_low);
     
     // Convert msgId to string
     id_idx = 0;
@@ -438,6 +520,33 @@ int build_test_msg(char *msg_text, char *json_output, int max_json_len, char *ou
     i = 0;
     while (id_str[i])
         *p++ = id_str[i++];
+    
+    // ,"Guid":
+    *p++ = ',';
+    *p++ = '"';
+    *p++ = 'G';
+    *p++ = 'u';
+    *p++ = 'i';
+    *p++ = 'd';
+    *p++ = '"';
+    *p++ = ':';
+    *p++ = '"';
+    
+    // Convert GUID to hex string (8 chars)
+    for (i = 3; i >= 0; i--)
+    {
+        unsigned char nibble;
+        nibble = ((*guid_high) >> (i * 4)) & 0x0F;
+        *p++ = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    for (i = 3; i >= 0; i--)
+    {
+        unsigned char nibble;
+        nibble = ((*guid_low) >> (i * 4)) & 0x0F;
+        *p++ = (nibble < 10) ? ('0' + nibble) : ('A' + nibble - 10);
+    }
+    
+    *p++ = '"';
     
     // ,"Category":"Test"
     *p++ = ','; *p++ = '"'; *p++ = 'C'; *p++ = 'a'; *p++ = 't'; *p++ = 'e';
@@ -566,7 +675,7 @@ int main() {
     unsigned int sub_len;
     char pub_topic1[] = "rp6502_pub";
     int msg_count = 0;
-    int publish_total;
+        int publish_total = 10;
     int i, j;
     volatile long k;
     unsigned int msg_len, topic_len, bytes_read;
@@ -665,11 +774,17 @@ int main() {
     
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
-    publish_total = 5;
+    publish_total = 10;
 
     for (i = 0; i < publish_total; i++) {
+        unsigned int msg_guid_high, msg_guid_low;
+        
         build_formatted_msg(i + 1, TEST_MSG_LENGTH, test_message, 512);    
-        build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash);
+        build_test_msg(test_message, json_message, 1024, sent_base64_msg, sent_base64_hash, &msg_guid_high, &msg_guid_low);
+        
+        /* Track this message */
+        track_message(msg_guid_high, msg_guid_low);
+        printf("\r\nTracking message with GUID: %04X%04X\n", msg_guid_high, msg_guid_low);
 
         xram_strcpy(0x0300, pub_topic1);
         xram_strcpy(0x0400, json_message);
@@ -717,9 +832,10 @@ int main() {
     //return 0;
 
     /* STEP 5: Listen for Messages */
-    print("[5/6] Listening for incoming messages (20 seconds)...\n");
+    print("[5/6] Listening for incoming messages...\n");
+    printf("Waiting for %d messages to be received\n", g_tracked_count);
     
-    for (i = 0; i < 200; i++) {  /* 20 seconds */
+    while (!all_messages_received()) {  /* 50 seconds max */
         RIA.op = 0x35;  /* mq_poll */
 
         while (RIA.busy) { }            
@@ -767,11 +883,92 @@ int main() {
             RIA.addr0 = 0x0600;
             RIA.step0 = 1;  // Enable auto-increment
 
-            for (j = 0; j < bytes_read; j++) {
-                putchar(RIA.rw0);
-            }
+            // for (j = 0; j < bytes_read; j++) {
+            //     putchar(RIA.rw0);
+            // }
 
             printf("\n");
+            
+            /* Parse GUID from received message */
+            {
+                char *guid_start;
+                char guid_str[9];
+                unsigned int recv_guid_high = 0;
+                unsigned int recv_guid_low = 0;
+                int k;
+                static char payload_buf[256];
+                
+                /* Copy payload to buffer for parsing */
+                RIA.addr0 = 0x0600;
+                RIA.step0 = 1;
+
+                for (j = 0; j < bytes_read && j < 255; j++) {
+                    payload_buf[j] = RIA.rw0;
+                    putchar(payload_buf[j]);                    
+                }
+                
+                payload_buf[j] = '\0';
+                
+                /* Look for "Guid" key (allow optional whitespace after colon) */
+                guid_start = my_strstr(payload_buf, "\"Guid\"");
+                if (guid_start) {
+                    /* Move past "Guid" */
+                    guid_start += 6; /* length of "Guid" */
+
+                    /* Skip optional spaces and colon */
+                    while (*guid_start == ' ')
+                        guid_start++;
+                    if (*guid_start == ':')
+                        guid_start++;
+                    while (*guid_start == ' ')
+                        guid_start++;
+
+                    /* Expect opening quote */
+                    if (*guid_start == '"')
+                        guid_start++;
+                    
+                    /* Extract 8 hex characters */
+                    for (k = 0; k < 8 && guid_start[k] != '\0' && guid_start[k] != '\"'; k++) {
+                        guid_str[k] = guid_start[k];
+                    }
+                    guid_str[k] = '\0';
+                    
+                    /* Parse hex string to GUID values */
+                    if (k == 8) {
+                        for (k = 0; k < 4; k++) {
+                            char c = guid_str[k];
+                            recv_guid_high = (recv_guid_high << 4);
+                            if (c >= '0' && c <= '9')
+                                recv_guid_high |= (c - '0');
+                            else if (c >= 'A' && c <= 'F')
+                                recv_guid_high |= (c - 'A' + 10);
+                            else if (c >= 'a' && c <= 'f')
+                                recv_guid_high |= (c - 'a' + 10);
+                        }
+                        
+                        for (k = 4; k < 8; k++) {
+                            char c = guid_str[k];
+                            recv_guid_low = (recv_guid_low << 4);
+                            if (c >= '0' && c <= '9')
+                                recv_guid_low |= (c - '0');
+                            else if (c >= 'A' && c <= 'F')
+                                recv_guid_low |= (c - 'A' + 10);
+                            else if (c >= 'a' && c <= 'f')
+                                recv_guid_low |= (c - 'a' + 10);
+                        }
+                        
+                        printf("Received message GUID: %04X%04X\n", recv_guid_high, recv_guid_low);
+                        
+                        /* Mark as received */
+                        if (mark_received(recv_guid_high, recv_guid_low)) {
+                            printf("Message matched and marked received! (%d/%d)\n", 
+                                   count_received_messages(), g_tracked_count);
+                        } else {
+                            printf("Message GUID not in tracking list\n");
+                        }
+                    }
+                }
+            }
 
             // printf("Payload (%d bytes): ", bytes_read);
             // RIA.addr0 = 0x0600;
@@ -790,12 +987,19 @@ int main() {
             fflush(stdout);
         }
         
-        /* Delay ~100ms */
+   
+        if (all_messages_received())
+        {
+            printf("\n\nAll messages received! Ending gracefully.\n");
+        }
+
         for (k = 0; k < 10000; k++);
     }
     
-    printf("\n\nReceived %d message%s total\n\n", 
+    printf("\n\nReceived %d message%s total\n", 
            msg_count, msg_count == 1 ? "" : "s");
+    printf("Tracked/Matched: %d/%d messages\n\n", 
+           count_received_messages(), g_tracked_count);
     
     /* STEP 6: Disconnect */
     printf("[6/6] Disconnecting from broker...\n");
