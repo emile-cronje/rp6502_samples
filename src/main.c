@@ -14,7 +14,6 @@
 #define TEST_MSG_LENGTH 1       // Number of times to repeat the message template
 #define MAX_TRACKED_MESSAGES 10 // Maximum messages to track
 
-volatile uint8_t mq_irq_flag = 0;
 static int g_tcp_fd = -1;
 
 /* Message tracking structure */
@@ -34,28 +33,6 @@ void print(char *s)
     while (*s)
         if (RIA.ready & RIA_READY_TX_BIT)
             RIA.tx = *s++;
-}
-
-void __fastcall__ irq_handler(void) {
-    mq_irq_flag = 1;
-}
-
-void set_irq_handler(void (*handler)(void)) {
-    // Install IRQ vector for cc65/6502
-    // The IRQ vector is at $FFFE-$FFFF, but cc65 provides a wrapper
-    // For RP6502, we write the handler address to the IRQ vector
-    unsigned int addr = (unsigned int)handler;
-    
-    // Write low byte to $FFFE
-    *(unsigned char *)0xFFFE = (unsigned char)(addr & 0xFF);
-    // Write high byte to $FFFF
-    *(unsigned char *)0xFFFF = (unsigned char)(addr >> 8);
-}
-
-void setup_irq(void) {
-    __asm__("sei");
-    set_irq_handler(irq_handler);
-    __asm__("cli");
 }
 
 char* my_strstr(const char *haystack, const char *needle)
@@ -312,18 +289,6 @@ bool init_wifi(int fd)
         return false;
 
     delay_ms(2000);  // Wait after connection
-    
-    // AT+CIFSR - Get IP address
-//    if (!send_at_command(fd, "AT+CIFSR", ok_resp, 1))
-  //      return false;
-    
-    // AT+CIPMUX=0 - Single connection mode
-  //  if (!send_at_command(fd, "AT+CIPMUX=0", ok_resp, 1))
-    //    return false;
-    
-    // AT+CIPRECVMODE=0 - Active receive mode (data pushed via +IPD)
-    // This may fail on some firmware - continue even if it errors
-//    send_at_command(fd, "AT+CIPRECVMODE=0", ok_resp, 1);
     
     // AT+CIPSTART - Start TCP connection
     my_sprintf(cmd, "AT+CIPSTART=\"TCP\",\"%s\",%s", SERVER_IP, SERVER_PORT);
@@ -679,7 +644,7 @@ int main() {
     unsigned int sub_len;
     char pub_topic1[] = "rp6502_pub";
     int msg_count = 0;
-        int publish_total = 10;
+    int publish_total = 10;
     int i, j;
     volatile long k;
     unsigned int msg_len, topic_len, bytes_read;
@@ -777,7 +742,6 @@ int main() {
     }
 
 //    *(uint8_t *)0xFFF0 = 0x01;  // Enable IRQs    
-  //  setup_irq();
 
     /* STEP 4: Publish Messages */
     print("[4/6] Publishing messages...\n");
@@ -843,14 +807,6 @@ int main() {
     printf("Waiting for %d messages to be received\n", g_tracked_count);
     
     while (!all_messages_received()) {  /* 50 seconds max */
-        // if (mq_irq_flag == 0) {
-        //     delay_ms(1);
-        //     continue;
-        // }
-
-        mq_irq_flag = 0;
-        //print("IRQ: New message available!\n");
-
         RIA.op = 0x35;  /* mq_poll */
 
         while (RIA.busy) { }            
