@@ -1,0 +1,434 @@
+#include "btree.h"
+#include <stdlib.h>
+#include <stdio.h>
+
+static BTreeNode *node_create(unsigned char is_leaf)
+{
+    BTreeNode *node;
+    unsigned char i;
+
+    node = (BTreeNode *)malloc(sizeof(BTreeNode));
+    if (!node)
+        return NULL;
+
+    node->key_count = 0;
+    node->is_leaf = is_leaf;
+
+    for (i = 0; i < 3; i++)
+        node->children[i] = NULL;
+
+    return node;
+}
+
+BTree *btree_create(void)
+{
+    BTree *tree;
+
+    tree = (BTree *)malloc(sizeof(BTree));
+    if (!tree)
+        return NULL;
+
+    tree->root = node_create(1);
+    if (!tree->root)
+    {
+        free(tree);
+        return NULL;
+    }
+
+    return tree;
+}
+
+static void node_split_child(BTreeNode *parent, unsigned char index)
+{
+    BTreeNode *full_child;
+    BTreeNode *new_node;
+    unsigned char i;
+
+    full_child = parent->children[index];
+    new_node = node_create(full_child->is_leaf);
+
+    if (!new_node)
+        return;
+
+    /* Move second key to new node */
+    new_node->keys[0] = full_child->keys[1];
+    new_node->values[0] = full_child->values[1];
+    new_node->key_count = 1;
+
+    /* If not leaf, move child pointer */
+    if (!full_child->is_leaf)
+        new_node->children[0] = full_child->children[2];
+
+    /* Reduce keys in full child */
+    full_child->key_count = 1;
+
+    /* Shift children in parent to make room */
+    for (i = parent->key_count; i > index; i--)
+        parent->children[i + 1] = parent->children[i];
+
+    /* Shift keys and values in parent to make room */
+    for (i = parent->key_count; i > index; i--)
+    {
+        parent->keys[i] = parent->keys[i - 1];
+        parent->values[i] = parent->values[i - 1];
+    }
+
+    /* Move middle key to parent */
+    parent->keys[index] = full_child->keys[1];
+    parent->values[index] = full_child->values[1];
+    parent->children[index + 1] = new_node;
+    parent->key_count++;
+}
+
+static void btree_insert_non_full(BTreeNode *node, unsigned char key, int value)
+{
+    int i;
+
+    i = node->key_count - 1;
+
+    if (node->is_leaf)
+    {
+        /* Insert key in sorted position */
+        while (i >= 0 && key < node->keys[i])
+        {
+            node->keys[i + 1] = node->keys[i];
+            node->values[i + 1] = node->values[i];
+            i--;
+        }
+
+        /* Check for duplicate */
+        if (i >= 0 && key == node->keys[i])
+        {
+            node->values[i] = value;
+            return;
+        }
+
+        node->keys[i + 1] = key;
+        node->values[i + 1] = value;
+        node->key_count++;
+    }
+    else
+    {
+        /* Find child to insert into */
+        while (i >= 0 && key < node->keys[i])
+            i--;
+
+        /* Check for duplicate */
+        if (i >= 0 && key == node->keys[i])
+        {
+            node->values[i] = value;
+            return;
+        }
+
+        i++;
+
+        /* Split child if full */
+        if (node->children[i]->key_count == 2)
+        {
+            node_split_child(node, i);
+
+            if (key > node->keys[i])
+                i++;
+        }
+
+        btree_insert_non_full(node->children[i], key, value);
+    }
+}
+
+void btree_insert(BTree *tree, unsigned char key, int value)
+{
+    BTreeNode *new_root;
+
+    if (!tree || !tree->root)
+        return;
+
+    if (tree->root->key_count == 2)
+    {
+        /* Root is full, split it */
+        new_root = node_create(0);
+        if (!new_root)
+            return;
+
+        new_root->children[0] = tree->root;
+        node_split_child(new_root, 0);
+        tree->root = new_root;
+    }
+
+    btree_insert_non_full(tree->root, key, value);
+}
+
+static int btree_search_node(BTreeNode *node, unsigned char key)
+{
+    unsigned char i;
+
+    i = 0;
+    while (i < node->key_count && key > node->keys[i])
+        i++;
+
+    if (i < node->key_count && key == node->keys[i])
+        return node->values[i];
+
+    if (node->is_leaf)
+        return (int)0x8000; /* Not found: -32768 */
+
+    return btree_search_node(node->children[i], key);
+}
+
+int btree_get(BTree *tree, unsigned char key)
+{
+    if (!tree || !tree->root)
+        return (int)0x8000;
+
+    return btree_search_node(tree->root, key);
+}
+
+unsigned char btree_update(BTree *tree, unsigned char key, int new_value)
+{
+    BTreeNode *node;
+    unsigned char i;
+
+    if (!tree || !tree->root)
+        return 0;
+
+    node = tree->root;
+
+    while (node)
+    {
+        i = 0;
+        while (i < node->key_count && key > node->keys[i])
+            i++;
+
+        if (i < node->key_count && key == node->keys[i])
+        {
+            node->values[i] = new_value;
+            return 1;
+        }
+
+        if (node->is_leaf)
+            return 0;
+
+        node = node->children[i];
+    }
+
+    return 0;
+}
+
+static void merge_nodes(BTreeNode *parent, unsigned char index)
+{
+    BTreeNode *left;
+    BTreeNode *right;
+    unsigned char i;
+
+    left = parent->children[index];
+    right = parent->children[index + 1];
+
+    /* Move parent key down */
+    left->keys[1] = parent->keys[index];
+    left->values[1] = parent->values[index];
+
+    /* Move right node's key to left */
+    if (!left->is_leaf)
+        left->children[2] = right->children[0];
+
+    left->key_count = 2;
+
+    /* Remove parent key */
+    for (i = index; i < parent->key_count - 1; i++)
+    {
+        parent->keys[i] = parent->keys[i + 1];
+        parent->values[i] = parent->values[i + 1];
+        parent->children[i + 1] = parent->children[i + 2];
+    }
+
+    parent->key_count--;
+    free(right);
+}
+
+static void btree_delete_node(BTreeNode *node, unsigned char key)
+{
+    unsigned char i;
+    BTreeNode *child;
+    BTreeNode *left;
+    BTreeNode *right;
+    unsigned char j;
+
+    i = 0;
+    while (i < node->key_count && key > node->keys[i])
+        i++;
+
+    if (i < node->key_count && key == node->keys[i])
+    {
+        if (node->is_leaf)
+        {
+            /* Simple case: key is in leaf */
+            while (i < node->key_count - 1)
+            {
+                node->keys[i] = node->keys[i + 1];
+                node->values[i] = node->values[i + 1];
+                i++;
+            }
+            node->key_count--;
+        }
+        else
+        {
+            /* Internal node: replace with predecessor or successor */
+            child = node->children[i];
+            if (child->key_count > 1)
+            {
+                node->keys[i] = child->keys[child->key_count - 1];
+                node->values[i] = child->values[child->key_count - 1];
+                btree_delete_node(child, child->keys[child->key_count - 1]);
+            }
+            else
+            {
+                merge_nodes(node, i);
+                btree_delete_node(node, key);
+            }
+        }
+    }
+    else if (!node->is_leaf)
+    {
+        child = node->children[i];
+
+        if (child->key_count == 1)
+        {
+            if (i > 0 && node->children[i - 1]->key_count > 1)
+            {
+                /* Borrow from left sibling */
+                left = node->children[i - 1];
+
+                for (j = child->key_count; j > 0; j--)
+                {
+                    child->keys[j] = child->keys[j - 1];
+                    child->values[j] = child->values[j - 1];
+                }
+                if (!child->is_leaf)
+                    for (j = child->key_count + 1; j > 0; j--)
+                        child->children[j] = child->children[j - 1];
+
+                child->keys[0] = node->keys[i - 1];
+                child->values[0] = node->values[i - 1];
+                if (!child->is_leaf)
+                    child->children[0] = left->children[left->key_count];
+
+                node->keys[i - 1] = left->keys[left->key_count - 1];
+                node->values[i - 1] = left->values[left->key_count - 1];
+
+                left->key_count--;
+                child->key_count++;
+            }
+            else if (i < node->key_count && node->children[i + 1]->key_count > 1)
+            {
+                /* Borrow from right sibling */
+                right = node->children[i + 1];
+
+                child->keys[1] = node->keys[i];
+                child->values[1] = node->values[i];
+                if (!child->is_leaf)
+                    child->children[1] = right->children[0];
+
+                node->keys[i] = right->keys[0];
+                node->values[i] = right->values[0];
+
+                for (j = 0; j < right->key_count - 1; j++)
+                {
+                    right->keys[j] = right->keys[j + 1];
+                    right->values[j] = right->values[j + 1];
+                }
+                if (!right->is_leaf)
+                    for (j = 0; j <= right->key_count - 1; j++)
+                        right->children[j] = right->children[j + 1];
+
+                right->key_count--;
+                child->key_count++;
+            }
+            else
+            {
+                /* Merge with sibling */
+                if (i < node->key_count)
+                    merge_nodes(node, i);
+                else
+                    merge_nodes(node, i - 1);
+            }
+        }
+
+        btree_delete_node(node->children[i < node->key_count ? i : i - 1], key);
+    }
+}
+
+unsigned char btree_delete(BTree *tree, unsigned char key)
+{
+    if (!tree || !tree->root)
+        return 0;
+
+    if (btree_get(tree, key) == (int)0x8000)
+        return 0; /* Key not found */
+
+    btree_delete_node(tree->root, key);
+
+    if (tree->root->key_count == 0 && !tree->root->is_leaf && tree->root->children[0])
+    {
+        BTreeNode *old_root;
+        old_root = tree->root;
+        tree->root = old_root->children[0];
+        free(old_root);
+    }
+
+    return 1;
+}
+
+static void btree_print_node(BTreeNode *node, int depth)
+{
+    unsigned char i;
+    int j;
+
+    if (!node)
+        return;
+
+    for (j = 0; j < depth; j++)
+        putchar(' ');
+
+    printf("Node: ");
+    for (i = 0; i < node->key_count; i++)
+        printf("[%d:%d] ", node->keys[i], node->values[i]);
+    putchar('\n');
+
+    if (!node->is_leaf)
+        for (i = 0; i <= node->key_count; i++)
+            btree_print_node(node->children[i], depth + 2);
+}
+
+void btree_print(BTree *tree)
+{
+    if (!tree || !tree->root)
+    {
+        puts("Empty tree");
+        return;
+    }
+
+    puts("B-tree structure:");
+    btree_print_node(tree->root, 0);
+}
+
+static void btree_free_node(BTreeNode *node)
+{
+    unsigned char i;
+
+    if (!node)
+        return;
+
+    if (!node->is_leaf)
+        for (i = 0; i <= node->key_count; i++)
+            btree_free_node(node->children[i]);
+
+    free(node);
+}
+
+void btree_free(BTree *tree)
+{
+    if (!tree)
+        return;
+
+    btree_free_node(tree->root);
+    free(tree);
+}

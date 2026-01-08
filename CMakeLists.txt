@@ -12,4 +12,5 @@ rp6502_executable(hello
 )
 target_sources(hello PRIVATE
     src/main.c
+    src/btree.c
 )
