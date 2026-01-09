@@ -92,7 +92,7 @@ static void node_split_child(BTreeNode *parent, unsigned char index)
     parent->key_count++;
 }
 
-static void btree_insert_non_full(BTreeNode *node, unsigned int key, int value)
+static void btree_insert_non_full(BTreeNode *node, unsigned int key, void *value)
 {
     int i;
 
@@ -147,7 +147,7 @@ static void btree_insert_non_full(BTreeNode *node, unsigned int key, int value)
     }
 }
 
-void btree_insert(BTree *tree, unsigned int key, int value)
+void btree_insert(BTree *tree, unsigned int key, void *value)
 {
     BTreeNode *new_root;
 
@@ -169,7 +169,7 @@ void btree_insert(BTree *tree, unsigned int key, int value)
     btree_insert_non_full(tree->root, key, value);
 }
 
-static int btree_search_node(BTreeNode *node, unsigned int key)
+static void *btree_search_node(BTreeNode *node, unsigned int key)
 {
     unsigned char i;
 
@@ -181,7 +181,7 @@ static int btree_search_node(BTreeNode *node, unsigned int key)
         return node->values[i];
 
     if (node->is_leaf)
-        return (int)0x8000; /* Not found: -32768 */
+        return NULL; /* Not found */
 
     return btree_search_node(node->children[i], key);
 }
@@ -205,10 +205,10 @@ static unsigned int btree_count_nodes_internal(BTreeNode *node)
     return count;
 }
 
-int btree_get(BTree *tree, unsigned int key)
+void *btree_get(BTree *tree, unsigned int key)
 {
     if (!tree || !tree->root)
-        return (int)0x8000;
+        return NULL;
 
     return btree_search_node(tree->root, key);
 }
@@ -221,7 +221,7 @@ unsigned int btree_node_count(BTree *tree)
     return btree_count_nodes_internal(tree->root);
 }
 
-unsigned char btree_update(BTree *tree, unsigned int key, int new_value)
+unsigned char btree_update(BTree *tree, unsigned int key, void *new_value)
 {
     BTreeNode *node;
     unsigned char i;
@@ -320,18 +320,26 @@ static void btree_delete_node(BTreeNode *node, unsigned int key)
         }
         else
         {
-            /* Internal node: replace with predecessor or successor */
-            child = node->children[i];
-            if (child->key_count > BTREE_MIN_KEYS)
+            /* Internal node: choose predecessor or successor; otherwise merge */
+            left = node->children[i];
+            right = node->children[i + 1];
+
+            if (left->key_count > BTREE_MIN_KEYS)
             {
-                node->keys[i] = child->keys[child->key_count - 1];
-                node->values[i] = child->values[child->key_count - 1];
-                btree_delete_node(child, child->keys[child->key_count - 1]);
+                node->keys[i] = left->keys[left->key_count - 1];
+                node->values[i] = left->values[left->key_count - 1];
+                btree_delete_node(left, node->keys[i]);
+            }
+            else if (right->key_count > BTREE_MIN_KEYS)
+            {
+                node->keys[i] = right->keys[0];
+                node->values[i] = right->values[0];
+                btree_delete_node(right, node->keys[i]);
             }
             else
             {
                 merge_nodes(node, i);
-                btree_delete_node(node, key);
+                btree_delete_node(left, key);
             }
         }
     }
@@ -395,13 +403,20 @@ static void btree_delete_node(BTreeNode *node, unsigned int key)
             {
                 /* Merge with sibling */
                 if (i < node->key_count)
+                {
                     merge_nodes(node, i);
+                }
                 else
-                    merge_nodes(node, i - 1);
+                {
+                    merge_nodes(node, (unsigned char)(i - 1));
+                    i = (unsigned char)(i - 1);
+                }
+
+                child = node->children[i];
             }
         }
 
-        btree_delete_node(node->children[i < node->key_count ? i : i - 1], key);
+        btree_delete_node(child, key);
     }
 }
 
@@ -410,7 +425,7 @@ unsigned char btree_delete(BTree *tree, unsigned int key)
     if (!tree || !tree->root)
         return 0;
 
-    if (btree_get(tree, key) == (int)0x8000)
+    if (btree_get(tree, key) == NULL)
         return 0; /* Key not found */
 
     btree_delete_node(tree->root, key);
@@ -422,6 +437,10 @@ unsigned char btree_delete(BTree *tree, unsigned int key)
         tree->root = old_root->children[0];
         free(old_root);
     }
+
+    /* Verify deletion was successful */
+    if (btree_get(tree, key) != NULL)
+        return 0; /* Delete failed - key still exists */
 
     return 1;
 }

@@ -23,7 +23,7 @@
 typedef struct BTreeNode
 {
     unsigned int keys[BTREE_MAX_KEYS];      /* Key storage */
-    int values[BTREE_MAX_KEYS];              /* Values associated with keys */
+    void *values[BTREE_MAX_KEYS];           /* Generic values - can store any pointer */
     struct BTreeNode *children[BTREE_MAX_CHILDREN]; /* Child pointers */
     unsigned char key_count;   /* Number of keys in this node */
     unsigned char is_leaf;     /* 1 if leaf, 0 if internal node */
@@ -37,14 +37,14 @@ typedef struct
 /* Initialize a new B-tree */
 BTree *btree_create(void);
 
-/* Insert a key-value pair */
-void btree_insert(BTree *tree, unsigned int key, int value);
+/* Insert a key-value pair (value is a void pointer) */
+void btree_insert(BTree *tree, unsigned int key, void *value);
 
-/* Search for a key, returns value or -32768 if not found */
-int btree_get(BTree *tree, unsigned int key);
+/* Search for a key, returns value pointer or NULL if not found */
+void *btree_get(BTree *tree, unsigned int key);
 
 /* Update an existing key's value */
-unsigned char btree_update(BTree *tree, unsigned int key, int new_value);
+unsigned char btree_update(BTree *tree, unsigned int key, void *new_value);
 
 /* Delete a key from the tree */
 unsigned char btree_delete(BTree *tree, unsigned int key);

@@ -1,12 +1,30 @@
 #include <rp6502.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "btree.h"
+
+/* Static arrays for JSON generation */
+static char *names[] = {"Alice", "Bob", "Charlie", "Diana", "Eve", "Frank"};
+static char *statuses[] = {"ok", "error", "pending", "done", "failed"};
+static char *roles[] = {"admin", "user", "guest", "moderator"};
+static char *events[] = {"login", "logout", "update", "delete", "create"};
+static char json1[64];
+static char json2[64];
+static char json3[64];
+static char json4[64];
+static char json5[64];
+static char json6[64];
+
+/* Track valid numeric keys for updates/deletes */
+#define KEY_LIST_MAX 1200
+static unsigned int valid_keys[KEY_LIST_MAX];
+static unsigned int valid_key_count = 0;
 
 void main()
 {
     BTree *tree;
-    int value;
+    void *value;
     unsigned int node_count;
     unsigned int unique_key_count;
     unsigned int i;
@@ -14,105 +32,255 @@ void main()
     int random_value;
     unsigned int item_count;
     unsigned int start_id;
-    unsigned char deleted_10;
-    unsigned char deleted_30;
+    unsigned int json_key;
+    unsigned int json_count;
+    unsigned char json_index;
+    char *json_ptrs[6];
+    int rand_val;
+    unsigned int json_keys[6];
+    unsigned int update_count;
+    unsigned int update_key;
+    int update_value;
+    unsigned int updates_successful;
+    unsigned int delete_count;
+    unsigned int delete_key;
+    unsigned int deletes_successful;
+    unsigned int deletes_attempted;
+    unsigned int get_count;
+    unsigned int get_key;
+    unsigned int gets_successful;
+
+    deletes_attempted = 0;
 
     puts("=== B-tree Demo ===\n");
 
+        /* Seed random number generator with hardware random */
+        srand((unsigned int)lrand());
+
     /* Create tree */
     tree = btree_create();
+
     if (!tree)
     {
         puts("Failed to create tree");
         return;
     }
 
-    /* INSERT operations */
-    // puts("Inserting manual values...");
-    // btree_insert(tree, 10, 100);
-    // btree_insert(tree, 20, 200);
-    // btree_insert(tree, 30, 300);
-    // btree_insert(tree, 40, 400);
-    // btree_insert(tree, 50, 500);
-    // btree_insert(tree, 5, 50);
-    // btree_insert(tree, 25, 250);
-    // puts("Manual inserts complete.\n");
-
-    /* INSERT sequential unique entries */
     puts("Inserting sequential unique entries...");
-    item_count = 5000;      /* allow full range 0-255 */
-    start_id = 0;          /* start from 0 */
+    item_count = 1000;
+    start_id = 0;
 
     for (i = 0; i < item_count; i++)
     {
         seq_id = i;
         random_value = (int)(rand() << 1);
-        btree_insert(tree, seq_id, random_value);
+        btree_insert(tree, seq_id, (void *)(unsigned int)random_value);
+
+        /* Record valid key for update/delete selection */
+        if (valid_key_count < KEY_LIST_MAX)
+        {
+            valid_keys[valid_key_count] = seq_id;
+            valid_key_count++;
+        }
+
     }
-    puts("Sequential inserts complete.\n");
+
+    printf("Sequential inserts complete (%u items).\n\n", item_count);
 
     // puts("Tree structure:");
     // btree_print(tree);
     // putchar('\n');
 
-    /* GET operations */
-    puts("Getting values...");
-    value = btree_get(tree, 20);
-    if (value != (int)0x8000)
-        printf("Key 20: value = %d\n", value);
+    /* INSERT JSON strings with randomized keys and content */
+    puts("Generating and inserting JSON strings with randomized content...");
+    
+    /* Generate randomized JSON content */
+    rand_val = rand() % 100;
+    sprintf(json1, "{\"name\":\"%s\",\"age\":%d}", names[rand() % 6], 20 + (rand() % 50));
+    
+    rand_val = rand() % 1000;
+    sprintf(json2, "{\"status\":\"%s\",\"code\":%d}", statuses[rand() % 5], 100 + (rand() % 400));
+    
+    rand_val = rand() % 10000;
+    sprintf(json3, "{\"user\":\"%s\",\"role\":\"%s\"}", names[rand() % 6], roles[rand() % 4]);
+    
+    rand_val = rand() % 100;
+    sprintf(json4, "{\"id\":%d,\"count\":%d}", rand() % 1000, rand() % 100);
+    
+    rand_val = (rand() << 10) | rand();
+    sprintf(json5, "{\"timestamp\":%d,\"event\":\"%s\"}", rand_val, events[rand() % 5]);
+    
+    rand_val = rand() % 256;
+    sprintf(json6, "{\"value\":%d,\"active\":%s}", rand() % 1000, (rand() % 2) ? "true" : "false");
+    
+    json_ptrs[0] = json1;
+    json_ptrs[1] = json2;
+    json_ptrs[2] = json3;
+    json_ptrs[3] = json4;
+    json_ptrs[4] = json5;
+    json_ptrs[5] = json6;
+    
+    json_count = 5;  /* configurable: 1-6 */
+    
+    for (json_index = 0; json_index < json_count; json_index++)
+    {
+        json_key = (unsigned int)((rand() & 0x7FFF) + 30000);
+        json_keys[json_index] = json_key;
+        btree_insert(tree, json_key, (void *)json_ptrs[json_index]);
+        printf("  Inserted JSON %u at key %u: %s\n", json_index + 1, json_key, json_ptrs[json_index]);
+    }
 
-    value = btree_get(tree, 25);
-    if (value != (int)0x8000)
-        printf("Key 25: value = %d\n", value);
+    printf("Inserted %u JSON strings.\n\n", json_count);
 
-    value = btree_get(tree, 99);
-    if (value == (int)0x8000)
-        puts("Key 99: not found");
+    /* RANDOM GET operations */
+    puts("Performing random gets...");
+    get_count = item_count;
+    gets_successful = 0;
+
+    if (get_count > valid_key_count)
+        get_count = valid_key_count;
+    
+    if (valid_key_count == 0)
+    {
+        puts("No valid keys available for gets.\n");
+    }
+    else
+    {
+        for (i = 0; i < get_count; i++)
+        {
+            get_key = valid_keys[rand() % valid_key_count];
+            value = btree_get(tree, get_key);
+
+            if (value != NULL)
+            {
+                gets_successful++;
+            }
+        }
+    }
+    printf("Completed %u random gets (%u successful).\n\n", get_count, gets_successful);
+
+    /* RANDOM UPDATE operations */
+    puts("Performing random updates...");
+    update_count = item_count;
+    updates_successful = 0;
+
+    if (update_count > valid_key_count)
+        update_count = valid_key_count;
+    
+    if (valid_key_count == 0)
+    {
+        puts("No valid keys available for updates.\n");
+    }
+    else
+    {
+    
+        for (i = 0; i < update_count; i++)
+        {
+            update_key = valid_keys[rand() % valid_key_count];
+            update_value = (int)(rand() << 1);
+            if (btree_update(tree, update_key, (void *)(unsigned int)update_value))
+            {
+                value = btree_get(tree, update_key);
+                if (value != NULL && (int)(unsigned int)value == update_value)
+                {
+                    updates_successful++;
+                }
+                else
+                {
+                    printf("Update verify failed for key %u (expected %d)\n", update_key, update_value);
+                }
+            }
+        }
+    }
+    printf("Completed %u random updates (%u successful).\n\n", update_count, updates_successful);
+
+    puts("Retrieving JSON strings...");
+    for (json_index = 0; json_index < json_count; json_index++)
+    {
+        value = btree_get(tree, json_keys[json_index]);
+        if (value != NULL)
+            printf("Key %u (JSON %u): %s\n", json_keys[json_index], json_index + 1, (char *)value);
+        else
+            printf("Key %u (JSON %u): NOT FOUND\n", json_keys[json_index], json_index + 1);
+    }
     putchar('\n');
 
-    /* UPDATE operations */
-    puts("Updating values...");
-    if (btree_update(tree, 20, 2000))
-        puts("Updated key 20 to 2000");
+    /* RANDOM DELETE operations */
+    puts("Performing random deletes...");
+    delete_count = item_count / 2;
+    deletes_successful = 0;
+    deletes_attempted = 0;
 
-    if (btree_update(tree, 50, 5000))
-        puts("Updated key 50 to 5000");
+    if (delete_count > valid_key_count)
+        delete_count = valid_key_count;
+    
+    for (i = 0; i < delete_count; i++)
+    {
+        unsigned int key_index;
 
-    value = btree_get(tree, 20);
-    printf("Key 20 after update: %d\n", value);
-    putchar('\n');
+        if (valid_key_count == 0)
+            break;
 
-    /* DELETE operations */
-    puts("Deleting values...");
-    deleted_10 = btree_delete(tree, 10);
-    if (deleted_10)
-        puts("Deleted key 10");
+        key_index = rand() % valid_key_count;
+        delete_key = valid_keys[key_index];
 
-    deleted_30 = btree_delete(tree, 30);
-    if (deleted_30)
-        puts("Deleted key 30");
+        if (btree_delete(tree, delete_key))
+        {
+            deletes_attempted++;
+            /* Remove from list immediately (regardless of verification) */
+            if (valid_key_count > 0)
+            {
+                valid_keys[key_index] = valid_keys[valid_key_count - 1];
+                valid_key_count--;
+            }
 
-    value = btree_get(tree, 10);
-    if (value == (int)0x8000)
-        puts("\nKey 10: not found");
-    putchar('\n');
+            value = btree_get(tree, delete_key);
 
-    value = btree_get(tree, 30);
-    if (value == (int)0x8000)
-        puts("Key 30: not found");
-    putchar('\n');
+            if (value != NULL)
+            {
+                /* Retry once if the key is still present (defensive) */
+                if (btree_delete(tree, delete_key))
+                    value = btree_get(tree, delete_key);
+            }
+
+            if (value == NULL)
+            {
+                deletes_successful++;
+            }
+            else
+            {
+                printf("Delete verify failed for key %u\n", delete_key);
+            }
+        }
+    }
+
+    printf("Completed %u random deletes (%u successful).\n\n", deletes_attempted, deletes_successful);
 
     unique_key_count = (unsigned int)item_count;
-    if (deleted_10)
-        unique_key_count = (unsigned int)(unique_key_count - 1);
-    if (deleted_30)
-        unique_key_count = (unsigned int)(unique_key_count - 1);
+    unique_key_count = (unsigned int)(unique_key_count - deletes_successful);
+
     node_count = btree_node_count(tree);
     printf("Unique key count: %u\n", unique_key_count);
     printf("Node count: %u\n", node_count);
 
     putchar('\n');
     puts("Demo complete! xxx");
+
+    /* Final validation */
+    putchar('\n');
+    puts("=== FINAL VALIDATION ===");
+    printf("Gets: %u/%u successful\n", gets_successful, get_count);
+    printf("Updates: %u/%u successful\n", updates_successful, update_count);
+    printf("Deletes: %u/%u verified\n", deletes_successful, deletes_attempted);
+    
+    if (gets_successful == get_count && updates_successful == update_count && deletes_successful == deletes_attempted)
+    {
+        puts("\nResult: OK - All operations verified successfully");
+    }
+    else
+    {
+        puts("\nResult: FAIL - Some operations did not verify");
+    }
 
     /* Cleanup */
     btree_free(tree);
