@@ -49,43 +49,59 @@ void main()
     unsigned int get_count;
     unsigned int get_key;
     unsigned int gets_successful;
+    unsigned int stress_runs;
+    unsigned int run_index;
+    unsigned int runs_ok;
+    unsigned char run_ok;
 
-    deletes_attempted = 0;
+    puts("=== B-tree Demo (stress runs) ===\n");
 
-    puts("=== B-tree Demo ===\n");
+    stress_runs = 10; /* configurable */
+    runs_ok = 0;
+
+    for (run_index = 0; run_index < stress_runs; run_index++)
+    {
+        /* Reset per-run counters */
+        valid_key_count = 0;
+        deletes_attempted = 0;
+        deletes_successful = 0;
+        gets_successful = 0;
+        updates_successful = 0;
 
         /* Seed random number generator with hardware random */
         srand((unsigned int)lrand());
 
-    /* Create tree */
-    tree = btree_create();
+        /* Create tree */
+        tree = btree_create();
 
-    if (!tree)
-    {
-        puts("Failed to create tree");
-        return;
-    }
-
-    puts("Inserting sequential unique entries...");
-    item_count = 1000;
-    start_id = 0;
-
-    for (i = 0; i < item_count; i++)
-    {
-        seq_id = i;
-        random_value = (int)(rand() << 1);
-        btree_insert(tree, seq_id, (void *)(unsigned int)random_value);
-
-        /* Record valid key for update/delete selection */
-        if (valid_key_count < KEY_LIST_MAX)
+        if (!tree)
         {
-            valid_keys[valid_key_count] = seq_id;
-            valid_key_count++;
+            puts("Failed to create tree");
+            return;
         }
 
-    }
+        printf("\n-- Run %u --\n", run_index + 1);
 
-    printf("Sequential inserts complete (%u items).\n\n", item_count);
+        puts("Inserting sequential unique entries...");
+        item_count = (unsigned int)(100 + (rand() % 901)); /* random 100-1000 per run */
+        start_id = 0;
+
+        for (i = 0; i < item_count; i++)
+        {
+            seq_id = i;
+            random_value = (int)(rand() << 1);
+            btree_insert(tree, seq_id, (void *)(unsigned int)random_value);
+
+            /* Record valid key for update/delete selection */
+            if (valid_key_count < KEY_LIST_MAX)
+            {
+                valid_keys[valid_key_count] = seq_id;
+                valid_key_count++;
+            }
+
+        }
+
+        printf("Sequential inserts complete (%u items).\n\n", item_count);
 
     // puts("Tree structure:");
     // btree_print(tree);
@@ -273,15 +289,24 @@ void main()
     printf("Updates: %u/%u successful\n", updates_successful, update_count);
     printf("Deletes: %u/%u verified\n", deletes_successful, deletes_attempted);
     
+    run_ok = 0;
     if (gets_successful == get_count && updates_successful == update_count && deletes_successful == deletes_attempted)
     {
         puts("\nResult: OK - All operations verified successfully");
+        run_ok = 1;
     }
     else
     {
         puts("\nResult: FAIL - Some operations did not verify");
     }
 
+    if (run_ok)
+        runs_ok++;
+
     /* Cleanup */
     btree_free(tree);
+    }
+
+    /* Stress summary */
+    printf("\nStress summary: %u/%u runs passed\n", runs_ok, stress_runs);
 }
