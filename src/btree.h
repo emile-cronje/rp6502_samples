@@ -2,15 +2,29 @@
 #define BTREE_H
 
 /* B-tree implementation for RP6502
- * Order: 3 (max 2 keys per node, max 3 children)
- * Suitable for 256-byte stack limit and 16-bit int
+ * Default order is 3 (max 2 keys per node, max 3 children)
+ * Parameterize the maximum number of children with BTREE_MAX_CHILDREN.
+ * Suitable for 256-byte stack limit and 16-bit int.
  */
+
+#ifndef BTREE_MAX_CHILDREN
+#define BTREE_MAX_CHILDREN 10
+#endif
+
+#if (BTREE_MAX_CHILDREN < 3)
+#error "BTREE_MAX_CHILDREN must be at least 3"
+#endif
+
+#define BTREE_MAX_KEYS (BTREE_MAX_CHILDREN - 1)
+#define BTREE_MIN_CHILDREN ((BTREE_MAX_CHILDREN + 1) / 2)
+#define BTREE_MIN_KEYS (BTREE_MIN_CHILDREN - 1)
+#define BTREE_SPLIT_INDEX (BTREE_MAX_KEYS / 2)
 
 typedef struct BTreeNode
 {
-    unsigned char keys[2];      /* Max 2 keys */
-    int values[2];             /* Values associated with keys */
-    struct BTreeNode *children[3]; /* Max 3 children */
+    unsigned int keys[BTREE_MAX_KEYS];      /* Key storage */
+    int values[BTREE_MAX_KEYS];              /* Values associated with keys */
+    struct BTreeNode *children[BTREE_MAX_CHILDREN]; /* Child pointers */
     unsigned char key_count;   /* Number of keys in this node */
     unsigned char is_leaf;     /* 1 if leaf, 0 if internal node */
 } BTreeNode;
@@ -24,19 +38,22 @@ typedef struct
 BTree *btree_create(void);
 
 /* Insert a key-value pair */
-void btree_insert(BTree *tree, unsigned char key, int value);
+void btree_insert(BTree *tree, unsigned int key, int value);
 
 /* Search for a key, returns value or -32768 if not found */
-int btree_get(BTree *tree, unsigned char key);
+int btree_get(BTree *tree, unsigned int key);
 
 /* Update an existing key's value */
-unsigned char btree_update(BTree *tree, unsigned char key, int new_value);
+unsigned char btree_update(BTree *tree, unsigned int key, int new_value);
 
 /* Delete a key from the tree */
-unsigned char btree_delete(BTree *tree, unsigned char key);
+unsigned char btree_delete(BTree *tree, unsigned int key);
 
 /* Print tree structure (for debugging) */
 void btree_print(BTree *tree);
+
+/* Count total nodes in the tree */
+unsigned int btree_node_count(BTree *tree);
 
 /* Free all nodes in the tree */
 void btree_free(BTree *tree);
