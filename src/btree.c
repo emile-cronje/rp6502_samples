@@ -321,20 +321,23 @@ static void btree_delete_node(BTreeNode *node, unsigned int key)
         else
         {
             /* Internal node: choose predecessor or successor; otherwise merge */
+            unsigned int promote_key;
             left = node->children[i];
             right = node->children[i + 1];
 
             if (left->key_count > BTREE_MIN_KEYS)
             {
-                node->keys[i] = left->keys[left->key_count - 1];
+                promote_key = left->keys[left->key_count - 1];
+                node->keys[i] = promote_key;
                 node->values[i] = left->values[left->key_count - 1];
-                btree_delete_node(left, node->keys[i]);
+                btree_delete_node(left, promote_key);
             }
             else if (right->key_count > BTREE_MIN_KEYS)
             {
-                node->keys[i] = right->keys[0];
+                promote_key = right->keys[0];
+                node->keys[i] = promote_key;
                 node->values[i] = right->values[0];
-                btree_delete_node(right, node->keys[i]);
+                btree_delete_node(right, promote_key);
             }
             else
             {

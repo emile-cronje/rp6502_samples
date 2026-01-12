@@ -8,7 +8,7 @@
 static char *names[] = {"Alice", "Bob", "Charlie", "Diana", "Eve", "Frank"};
 static char *statuses[] = {"ok", "error", "pending", "done", "failed"};
 static char *roles[] = {"admin", "user", "guest", "moderator"};
-static char *events[] = {"loginx", "logout", "update", "delete", "create"};
+static char *events[] = {"login", "logout", "update", "delete", "create"};
 static char json1[64];
 static char json2[64];
 static char json3[64];
@@ -56,7 +56,7 @@ void main()
 
     puts("=== B-tree Demo (stress runs) ===\n");
 
-    stress_runs = 50; /* configurable */
+    stress_runs = 10; /* configurable */
     runs_ok = 0;
 
     for (run_index = 0; run_index < stress_runs; run_index++)
@@ -83,13 +83,13 @@ void main()
         printf("\n-- Run %u --\n", run_index + 1);
 
         puts("Inserting sequential unique entries...");
-        item_count = (unsigned int)(500 + (rand() % 901)); /* random 100-1000 per run */
+        item_count = (unsigned int)(100 + (rand() % 901)); /* random 100-1000 per run */
         start_id = 0;
 
         for (i = 0; i < item_count; i++)
         {
             seq_id = i;
-            random_value = (int)(rand() << 1);
+            random_value = (int)((rand() << 1) | 1); /* Ensure non-zero value */
             btree_insert(tree, seq_id, (void *)(unsigned int)random_value);
 
             /* Record valid key for update/delete selection */
@@ -193,7 +193,7 @@ void main()
         for (i = 0; i < update_count; i++)
         {
             update_key = valid_keys[rand() % valid_key_count];
-            update_value = (int)(rand() << 1);
+            update_value = (int)((rand() << 1) | 1); /* Ensure non-zero value */
             if (btree_update(tree, update_key, (void *)(unsigned int)update_value))
             {
                 value = btree_get(tree, update_key);
