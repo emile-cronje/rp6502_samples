@@ -286,7 +286,12 @@ static void merge_nodes(BTreeNode *parent, unsigned char index)
     {
         parent->keys[i] = parent->keys[i + 1];
         parent->values[i] = parent->values[i + 1];
-        parent->children[i + 1] = parent->children[i + 2];
+    }
+    
+    /* Shift children - need to close the gap from merged right node */
+    for (i = index + 1; i < parent->key_count; i++)
+    {
+        parent->children[i] = parent->children[i + 1];
     }
 
     parent->key_count--;
@@ -396,8 +401,10 @@ static void btree_delete_node(BTreeNode *node, unsigned int key)
                     right->values[j] = right->values[j + 1];
                 }
                 if (!right->is_leaf)
-                    for (j = 0; j <= right->key_count - 1; j++)
+                {
+                    for (j = 0; j < right->key_count; j++)
                         right->children[j] = right->children[j + 1];
+                }
 
                 right->key_count--;
                 child->key_count++;
