@@ -289,7 +289,7 @@ static void merge_nodes(BTreeNode *parent, unsigned char index)
     }
     
     /* Shift children - need to close the gap from merged right node */
-    for (i = index + 1; i <= parent->key_count; i++)
+    for (i = index + 1; i < parent->key_count; i++)
     {
         parent->children[i] = parent->children[i + 1];
     }

@@ -81,7 +81,7 @@ void main()
 
     puts("=== B-tree Demo (stress runs) ===\n");
 
-    stress_runs = 50;
+    stress_runs = 100;
     runs_ok = 0;
 
     for (run_index = 0; run_index < stress_runs; run_index++)
